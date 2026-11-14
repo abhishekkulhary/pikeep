@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>PiKeep — encrypted Raspberry Pi backups, run from your phone</title>
+<meta name="description" content="PiKeep is a remote control for the backup job on your Raspberry Pi. Pick what to back up, start it or schedule it, and watch it upload encrypted restic snapshots of Immich, Nextcloud and anything else to OneDrive.">
+
+<!--
+  Every path on this page is relative: GitHub Pages serves a project site from
+  /<repo>/, so a leading slash breaks the deploy. __REPO__ and __BASE_URL__ are
+  substituted by .github/workflows/pages.yaml; tool/check_site.sh fails the
+  build if either has been hard-coded away.
+-->
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="img/icon-192.png">
+<link rel="stylesheet" href="css/site.css">
+<link rel="canonical" href="__BASE_URL__/">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="PiKeep — encrypted Raspberry Pi backups">
+<meta property="og:description" content="Back up your Pi's photos, files and databases to OneDrive — encrypted, scheduled, and controlled from your phone or desktop.">
+<meta property="og:image" content="__BASE_URL__/img/desktop-running.png">
+<meta property="og:url" content="__BASE_URL__/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#04090B">
+</head>
+
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="backdrop" aria-hidden="true"></div>
+
+<header class="nav">
+  <a class="brand" href="./"><img src="icon.svg" alt="" width="30" height="30"> PiKeep</a>
+  <nav aria-label="Primary">
+    <a href="#how">How it works</a>
+    <a href="#features">Features</a>
+    <a href="#setup">Setup</a>
+    <a class="btn" href="#download">Download</a>
+  </nav>
+</header>
+
+<main id="main">
+
+  <!-- ------------------------------------------------------------ hero -->
+  <section class="hero">
+    <div>
+      <p class="eyebrow">Raspberry Pi · restic · OneDrive · Apache-2.0</p>
+      <h1>Your Pi backs itself up. <em>You just press start.</em></h1>
+      <p class="lead">
+        PiKeep is a remote control for the backup job on your Raspberry Pi.
+        Choose what to back up, start it or put it on a schedule, and watch
+        encrypted snapshots of your photos, files and databases upload to
+        OneDrive — while the Pi does all the work.
+      </p>
+      <div class="cta">
+        <a class="btn" href="#download">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14"/></svg>
+          Download
+        </a>
+        <a class="btn btn-ghost" href="https://github.com/__REPO__">View source</a>
+      </div>
+      <p class="meta">
+        <span>encrypted</span><span>no account</span><span>no telemetry</span><span data-version hidden></span>
+      </p>
+    </div>
+    <figure class="window hero-shot">
+      <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+      <img src="img/desktop-running.png" alt="PiKeep on the desktop: a scheduled backup of Immich is 62% uploaded, with transfer size, file count, time left and the steps still to come." width="1280" height="800">
+    </figure>
+  </section>
+
+  <!-- ------------------------------------------------------- how it works -->
+  <section id="how">
+    <h2><span class="idx">01</span>How it works</h2>
+    <p class="section-lead">
+      The app never touches your data. It tells the Pi what to back up and
+      where, and the Pi does the rest — so the backup keeps going when your
+      phone sleeps or your laptop is closed.
+    </p>
+
+    <div class="flow">
+      <div class="node">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M11 18h2"/></svg>
+        <h3>PiKeep app</h3>
+        <p>Phone or desktop. Picks sources, starts or schedules, shows progress.</p>
+      </div>
+      <div class="link">SSH<br>commands only</div>
+      <div class="node node-main">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h2M7 12h4M15 9v6M18 9v6"/></svg>
+        <h3>Raspberry Pi</h3>
+        <p>A small agent dumps the databases and runs restic as a background service.</p>
+      </div>
+      <div class="link">restic over rclone<br>encrypted</div>
+      <div class="node">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 17.8 8.6 4.7 4.7 0 0 1 17 18z"/><path d="M12 15v-4m0 0-2 2m2-2 2 2"/></svg>
+        <h3>OneDrive</h3>
+        <p>Holds encrypted, deduplicated snapshots. Microsoft sees only ciphertext.</p>
+      </div>
+    </div>
+
+    <div class="cards cards-3">
+      <article class="card card-lead">
+        <div class="dot"></div>
+        <h3>Runs without the app</h3>
+        <p>
+          A started backup is a systemd service on the Pi. Close the app, put
+          the phone away — reopen it later and it shows exactly where things
+          stand.
+        </p>
+      </article>
+      <article class="card card-lead">
+        <div class="dot"></div>
+        <h3>Encrypted before it leaves</h3>
+        <p>
+          restic encrypts and deduplicates everything on the Pi. After the
+          first upload, each backup only sends what changed.
+        </p>
+      </article>
+      <article class="card card-lead">
+        <div class="dot"></div>
+        <h3>Consistent databases</h3>
+        <p>
+          PostgreSQL and MariaDB are dumped right before their files are
+          backed up, and Nextcloud goes into maintenance mode for the
+          duration — and always comes back out of it.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- features -->
+  <section id="features">
+    <h2><span class="idx">02</span>Features</h2>
+    <p class="section-lead">Everything a home server's backup needs, and nothing that phones home.</p>
+
+    <div class="cards cards-3">
+      <article class="card">
+        <h3>Automatic schedules</h3>
+        <p>
+          Daily, every second day, weekly or monthly, at a time you choose.
+          If the Pi is off at that moment, the backup runs as soon as it is
+          back.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Keep the last N</h3>
+        <p>
+          Old snapshots are cleaned up automatically — two per source by
+          default, configurable. Only sources that backed up successfully are
+          ever pruned.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Live progress</h3>
+        <p>
+          Percent, bytes, files, time left and the file being uploaded,
+          refreshed every few seconds — plus the full job log, one tap away.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Immich &amp; Nextcloud ready</h3>
+        <p>
+          Sensible defaults for both, with their database hooks. Add any other
+          folder on the Pi with a built-in folder browser.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Dry runs and checks</h3>
+        <p>
+          See what would be uploaded without changing anything, and
+          optionally read back a random 5% of the stored data after a backup.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Snapshots at a glance</h3>
+        <p>
+          Every snapshot per source with its size, and a marker on the ones
+          the next clean-up will remove.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- gallery -->
+  <section class="gallery" aria-label="Screenshots">
+    <figure>
+      <div class="phone">
+        <img src="img/phone-home.png" alt="PiKeep on a phone: the last run completed, with new data per source, and the weekly schedule with its next run." width="390" height="844" loading="lazy">
+      </div>
+      <figcaption>Last run and next run, on a phone.</figcaption>
+    </figure>
+    <figure>
+      <div class="window"><div class="window-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+        <img src="img/schedule.png" alt="The automatic backups screen: weekly on Sunday at 03:00, backing up Immich and Nextcloud to OneDrive and keeping the last two backups per source." width="800" height="900" loading="lazy">
+      </div>
+      <figcaption>Pick a rhythm once; the Pi keeps it.</figcaption>
+    </figure>
+  </section>
+
+  <!-- --------------------------------------------------------- security -->
+  <section id="security">
+    <h2><span class="idx">03</span>Safe by construction</h2>
+    <p class="section-lead">
+      The agent on the Pi runs as root and takes input from the network, so it
+      trusts nothing it is sent.
+    </p>
+    <div class="cards">
+      <article class="card">
+        <h3>One command, nothing else</h3>
+        <p>The sudoers rule allows exactly one program without a password. The app
+          cannot run anything else as root on your Pi.</p>
+      </article>
+      <article class="card">
+        <h3>Paths are fenced in</h3>
+        <p>Every folder is resolved — symlinks included — and must sit inside the
+          roots you allow, <code>/mnt/ssd</code> by default. Every other value is
+          checked against a strict pattern and passed as an argument, never to a shell.</p>
+      </article>
+      <article class="card">
+        <h3>A changed host key is a hard stop</h3>
+        <p>The Pi's SSH key is remembered on first connect. If it ever changes, the
+          app refuses to connect rather than warning and carrying on.</p>
+      </article>
+      <article class="card">
+        <h3>Secrets stay in the keychain</h3>
+        <p>Your SSH password or key lives in the platform keychain. No account,
+          no analytics, no server of ours in the middle.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------- setup -->
+  <section id="setup">
+    <h2><span class="idx">04</span>Set up your Pi</h2>
+    <p class="section-lead">
+      About fifteen minutes, once. Written for Raspberry Pi OS and Debian; the
+      backup tools need a recent rclone.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <h3>Install restic and a current rclone</h3>
+        <p>Debian's own rclone package is too old for OneDrive uploads, so take
+          rclone from its project site.</p>
+        <pre><code>sudo apt install -y restic jq
+sudo -v ; curl https://rclone.org/install.sh | sudo bash</code></pre>
+      </li>
+      <li>
+        <h3>Connect OneDrive</h3>
+        <p>Create a remote called <code>onedrive</code>. On a Pi without a
+          browser, rclone tells you to finish the sign-in with
+          <code>rclone authorize "onedrive"</code> on your computer.</p>
+        <pre><code>sudo rclone config</code></pre>
+      </li>
+      <li>
+        <h3>Create the backup password</h3>
+        <p>Every backup is encrypted with it. <strong>Save a copy in your
+          password manager</strong> — without it, nothing can be restored.</p>
+        <pre><code>sudo sh -c 'umask 077; openssl rand -base64 32 &gt; /root/.restic-pass'
+sudo cat /root/.restic-pass</code></pre>
+      </li>
+      <li>
+        <h3>Install the PiKeep agent</h3>
+        <p>Installs one script, its config and a sudoers rule for that script
+          only, then prints a self-test.</p>
+        <pre><code>curl -LO https://github.com/__REPO__/releases/latest/download/PiKeep-pi-agent.tar.gz
+tar xzf PiKeep-pi-agent.tar.gz &amp;&amp; cd pikeep-pi-agent
+sudo ./install.sh "$USER"</code></pre>
+      </li>
+      <li>
+        <h3>Connect the app</h3>
+        <p>In <strong>Settings</strong>, enter the Pi's host name and your SSH login,
+          then <em>Save &amp; test connection</em>. Pick the <code>onedrive</code> remote,
+          press <em>Initialize repository</em> once, and start with a dry run.</p>
+      </li>
+    </ol>
+  </section>
+
+  <!-- --------------------------------------------------------- download -->
+  <section id="download">
+    <h2><span class="idx">05</span>Get PiKeep</h2>
+    <p class="section-lead">
+      Free and open source under Apache-2.0. The agent for your Pi is in the
+      release too, as <code>PiKeep-pi-agent.tar.gz</code>.
+    </p>
+
+    <p class="status" data-release-status hidden></p>
+
+    <div class="downloads">
+      <article class="dl">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+        <h3>macOS</h3>
+        <p class="dl-sub">Apple silicon &amp; Intel</p>
+        <a class="btn" data-asset="PiKeep-macos.dmg" data-match="\.dmg$"
+           href="https://github.com/__REPO__/releases/latest">Download .dmg</a>
+        <p class="dl-meta" data-meta>Latest release</p>
+        <details>
+          <summary>Opening an unsigned build</summary>
+          <p>
+            This build is not signed or notarised, so macOS refuses it on first
+            open. Go to <strong>System Settings → Privacy &amp; Security</strong>,
+            find PiKeep under the warning, and click <strong>Open Anyway</strong>.
+            Or, from a terminal:
+          </p>
+          <code>xattr -d com.apple.quarantine /Applications/PiKeep.app</code>
+        </details>
+      </article>
+
+      <article class="dl">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4.5v7H3zM12.5 4.2 21 3v8.5h-8.5zM3 13h7.5v7L3 19zM12.5 13H21v8l-8.5-1.2z"/></svg>
+        <h3>Windows</h3>
+        <p class="dl-sub">x64, portable</p>
+        <a class="btn" data-asset="PiKeep-windows-x64.zip" data-match="windows.*\.zip$"
+           href="https://github.com/__REPO__/releases/latest">Download .zip</a>
+        <p class="dl-meta" data-meta>Latest release</p>
+        <details>
+          <summary>Getting past SmartScreen</summary>
+          <p>
+            Not code-signed, so SmartScreen shows “Windows protected your PC”.
+            Click <strong>More info → Run anyway</strong>. Unpack the zip anywhere
+            and run <code>pikeep.exe</code>.
+          </p>
+        </details>
+      </article>
+
+      <article class="dl">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6l5 5-5 5M12 18h8"/></svg>
+        <h3>Linux</h3>
+        <p class="dl-sub">x86_64 AppImage</p>
+        <a class="btn" data-asset="PiKeep-linux-x86_64.AppImage" data-match="\.appimage$"
+           href="https://github.com/__REPO__/releases/latest">Download AppImage</a>
+        <p class="dl-meta" data-meta>Latest release</p>
+        <details>
+          <summary>Running it</summary>
+          <p>Mark it executable and run it. Passwords are kept in the desktop's
+            keyring (libsecret).</p>
+          <code>chmod +x PiKeep-linux-x86_64.AppImage
+./PiKeep-linux-x86_64.AppImage</code>
+        </details>
+      </article>
+
+      <article class="dl">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="9" width="14" height="10" rx="2"/><path d="M8 9a4 4 0 0 1 8 0M8 5 7 3.5M16 5l1-1.5M9 19v2M15 19v2"/></svg>
+        <h3>Android</h3>
+        <p class="dl-sub">Universal APK</p>
+        <a class="btn" data-asset="PiKeep-android-universal.apk" data-match="\.apk$"
+           href="https://github.com/__REPO__/releases/latest">Download .apk</a>
+        <p class="dl-meta" data-meta>Latest release</p>
+        <details>
+          <summary>Installing from outside a store</summary>
+          <p>
+            Android asks you to allow installs from wherever you downloaded it.
+            Your phone needs to reach the Pi — for example over Tailscale.
+          </p>
+        </details>
+      </article>
+    </div>
+
+    <p class="note">
+      An unsigned iOS build is on the
+      <a href="https://github.com/__REPO__/releases">releases page</a> for anyone
+      who can sign and sideload it. There is no web version: a browser cannot open
+      the raw SSH connection the app needs.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <span>© <span id="year">2026</span> Abhishek Choudhary</span>
+  <!-- __BUILD__ / __BUILD_SHA__ are filled in by .github/workflows/pages.yaml. -->
+  <span>Built from <a href="https://github.com/__REPO__/commit/__BUILD_SHA__">__BUILD__</a></span>
+  <a href="https://github.com/__REPO__">Source on GitHub</a>
+  <a href="https://github.com/__REPO__/releases">Releases</a>
+  <a href="https://abhishekkulhary.github.io/portfolio/">Portfolio</a>
+  <p class="credits">Apache-2.0. Built with Flutter and dartssh2; backups by restic and rclone.</p>
+</footer>
+
+<script>document.getElementById('year').textContent = new Date().getFullYear();</script>
+<script src="js/download.js" defer></script>
+</body>
+</html>

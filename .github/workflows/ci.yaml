@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FLUTTER_VERSION: "3.50.0"
+
+jobs:
+  app:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze --fatal-infos --fatal-warnings
+      # Goldens are excluded: they render with the host's font rasteriser and
+      # exist to produce the website's screenshots, not to gate changes.
+      - run: flutter test -x golden
+
+  pi-agent:
+    name: Pi agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n pi/pi-backup-agent && bash -n pi/install.sh
+      - run: shellcheck pi/pi-backup-agent pi/install.sh tool/*.sh
+
+  site:
+    name: Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./tool/sync_site_images.sh
+      - run: ./tool/check_site.sh

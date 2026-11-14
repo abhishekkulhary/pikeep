@@ -1,0 +1,56 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+**/ephemeral/
+*.iml
+.idea/
+.vscode/
+
+# iOS / macOS
+**/Pods/
+**/xcuserdata/
+**/DerivedData/
+*.xcworkspace/xcuserdata/
+
+# Android
+**/.gradle/
+**/local.properties
+**/*.keystore
+**/key.properties
+android/app/.cxx/
+
+# OS
+.DS_Store
+
+# Xcode bundles: not committed. The Nextcloud sync renames them within seconds
+# ("Runner 2.xcodeproj"), so tool/setup_platforms.sh generates them wherever a
+# build happens (CI runs it before every build).
+ios/Runner.xcodeproj/
+ios/Runner.xcworkspace/
+macos/Runner.xcodeproj/
+macos/Runner.xcworkspace/
+ios/Runner [0-9]*/
+macos/Runner [0-9]*/
+**/Flutter/.last_build_id
+**/GeneratedPluginRegistrant.*
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/Flutter/ephemeral/
+
+# Website images are copied out of the golden tests (tool/sync_site_images.sh).
+site/img/
+
+# Editor and tool state
+.qodo/
+.github/modernize/
+coverage/
+failures/
+**/failures/
+
+# Local planning notes (contain private host names)
+HANDOFF.md

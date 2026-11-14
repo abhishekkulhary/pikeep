@@ -1,0 +1,3 @@
+tags:
+  golden:
+    description: Tests that compare rendered output against a golden image.

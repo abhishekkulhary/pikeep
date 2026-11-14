@@ -1,0 +1,962 @@
+#!/usr/bin/env bash
+#
+# pi-backup-agent — root-side helper driven by the "Pi Backup Remote" app over SSH.
+#
+#   sudo -n /usr/local/bin/pi-backup-agent <command> [args]
+#
+# Commands (all print one JSON object on stdout; {"ok":false,"error":...} on failure):
+#   info                                  versions, hostname, allowed roots, hooks, defaults
+#   remotes                               rclone remotes
+#   browse [path]                         sub-directories of a path under ALLOWED_ROOTS
+#   init --remote R --path P              create the restic repository
+#   validate                              validate a job (JSON on stdin), print the normalized job
+#   start                                 validate + launch a job (JSON on stdin) via systemd-run
+#   status                                state + progress + history of the current/last job
+#   cancel                                stop the running job
+#   log [n]                               last n lines of the job log (plain text)
+#   snapshots --remote R --path P         restic snapshots
+#   schedule                              automatic-backup schedule, next run, last result
+#   schedule-set                          set the schedule (JSON on stdin)
+#
+# The agent runs as root with network-supplied input: every value is validated and
+# passed as argv; nothing user-supplied is ever evaluated by a shell.
+#
+# jq programs are single-quoted on purpose (their $vars are jq variables):
+# shellcheck disable=SC2016
+set -Eeuo pipefail
+shopt -s lastpipe
+umask 077
+
+AGENT_VERSION="1.0.0"
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+CONF=/etc/pi-backup/agent.conf
+if [[ $EUID -eq 0 ]]; then
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  export HOME=/root
+elif [[ -n ${PI_BACKUP_AGENT_CONF:-} ]]; then
+  # Test mode (non-root only; sudo strips this variable anyway).
+  CONF=$PI_BACKUP_AGENT_CONF
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration (overridable in agent.conf)
+# ---------------------------------------------------------------------------
+ALLOWED_ROOTS="/mnt/ssd"
+REQUIRED_MOUNT="/mnt/ssd"
+RESTIC_PASSWORD_FILE="/root/.restic-pass"
+RCLONE_CONFIG="/root/.config/rclone/rclone.conf"
+STAGING_DIR="/mnt/ssd/backup-staging"
+STATE_DIR="/var/lib/pi-backup"
+CACHE_DIR="/var/cache/restic"
+LOCK_FILE="/run/pi-backup.lock"   # shared with the pi-backup CLI script
+DEFAULT_REMOTE="onedrive"
+DEFAULT_REPO_PATH="pi-backup"
+DEFAULT_KEEP_LAST=2
+UNIT="pi-backup-job"
+SCHED_UNIT="pi-backup-schedule"
+UNIT_DIR="/etc/systemd/system"
+HISTORY_MAX=20
+
+if [[ -r $CONF ]]; then
+  # shellcheck source=/dev/null
+  source "$CONF"
+fi
+
+export RESTIC_PASSWORD_FILE RCLONE_CONFIG
+export RESTIC_CACHE_DIR="$CACHE_DIR"
+export RESTIC_PROGRESS_FPS=0.5
+
+JOB_FILE="$STATE_DIR/job.json"
+STATE_FILE="$STATE_DIR/state.json"
+PROGRESS_FILE="$STATE_DIR/progress.json"
+LOG_FILE="$STATE_DIR/job.log"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+SCHEDULE_FILE="$STATE_DIR/schedule.json"
+SCHED_STATE="$STATE_DIR/schedule-state.json"
+
+read -r -a ROOTS <<<"$ALLOWED_ROOTS"
+HOOK_TYPES=(none postgres mariadb nextcloud)
+
+RE_ID='^[a-z0-9-]{1,40}$'
+RE_REMOTE='^[A-Za-z0-9_-]{1,64}$'
+RE_REPO='^[A-Za-z0-9._/-]{1,200}$'
+RE_DOTDOT='(^|/)\.\.(/|$)'
+RE_CONTAINER='^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$'
+RE_UINT='^[0-9]{1,6}$'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# fail writes to fd 3 (the real stdout) so it also works inside $(...); callers of
+# such substitutions use "|| exit 1" so the error is printed exactly once.
+fail() { jq -cn --arg e "$1" '{ok:false,error:$e}' >&3; exit 1; }
+log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
+json_array() { jq -cn '$ARGS.positional' --args "$@"; }
+
+# capture CMD...  → sets OUT (stdout) and ERRTXT (stderr), returns the command's status
+OUT="" ERRTXT=""
+capture() {
+  local ef rc=0
+  ef=$(mktemp "$STATE_DIR/.err.XXXXXX")
+  OUT=$("$@" 2>"$ef") || rc=$?
+  ERRTXT=$(tail -n 5 "$ef")
+  rm -f "$ef"
+  return "$rc"
+}
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+}
+
+# Prints the canonical path if $1 is an absolute path inside an allowed root.
+resolve_allowed() {
+  local p=$1 r root rr
+  [[ -n $p && $p == /* && ${#p} -le 4096 ]] || return 1
+  [[ $p == *[[:cntrl:]]* ]] && return 1
+  r=$(realpath -m -- "$p" 2>/dev/null) || return 1
+  for root in "${ROOTS[@]}"; do
+    rr=$(realpath -m -- "$root" 2>/dev/null) || continue
+    if [[ $r == "$rr" || $r == "$rr"/* ]]; then
+      printf '%s\n' "$r"
+      return 0
+    fi
+  done
+  return 1
+}
+
+valid_remote()    { [[ $1 =~ $RE_REMOTE ]]; }
+valid_repo_path() { [[ $1 =~ $RE_REPO && ! $1 =~ $RE_DOTDOT ]]; }
+valid_container() { [[ $1 =~ $RE_CONTAINER ]]; }
+
+unit_state() { systemctl is-active "$UNIT" 2>/dev/null || true; }
+job_running() {
+  case "$(unit_state)" in active|activating|deactivating|reloading) return 0 ;; esac
+  return 1
+}
+cli_lock_busy() { ! flock -n "$LOCK_FILE" true 2>/dev/null; }
+
+# parse --remote R --path P  → REMOTE, RPATH, REPO
+parse_repo_args() {
+  REMOTE="" RPATH=""
+  while (($# > 0)); do
+    case $1 in
+      --remote) (($# >= 2)) || fail "missing value for --remote"; REMOTE=$2; shift 2 ;;
+      --path)   (($# >= 2)) || fail "missing value for --path";   RPATH=$2;  shift 2 ;;
+      *) fail "unknown argument" ;;
+    esac
+  done
+  valid_remote "$REMOTE"  || fail "invalid rclone remote name"
+  valid_repo_path "$RPATH" || fail "invalid repository path"
+  REPO="rclone:$REMOTE:$RPATH"
+}
+
+# state_update FILTER [jq args...] — atomic update of state.json ($now is available)
+state_update() {
+  local filter=$1 tmp
+  shift
+  tmp="$STATE_FILE.tmp.$$"
+  if jq "$@" --arg now "$(now)" "$filter | .updatedAt=\$now" "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+history_json() {
+  if [[ -f $HISTORY_FILE ]]; then
+    jq -cRs 'split("\n") | map(select(length > 0) | (try fromjson catch empty)) | reverse' "$HISTORY_FILE"
+  else
+    echo '[]'
+  fi
+}
+
+append_history() {
+  jq -c '{id, startedAt, finishedAt, status, message, dryRun, trigger: (.trigger // "manual"),
+          sources: [.steps[] | select(.kind == "backup") | .id],
+          dataAdded: ([.steps[] | (.result.dataAdded? // 0)] | add // 0)}' \
+    "$STATE_FILE" >>"$HISTORY_FILE" 2>/dev/null || return 0
+  tail -n "$HISTORY_MAX" "$HISTORY_FILE" >"$HISTORY_FILE.tmp" && mv -f "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Job validation: validate_job RAW_FILE → prints normalized job JSON
+# ---------------------------------------------------------------------------
+read -r -d '' JOB_SHAPE <<'JQ' || true
+def str: type == "string";
+def strs: type == "array" and all(.[]; type == "string");
+(type == "object")
+and (.destination | type == "object")
+and (.destination.remote | str) and (.destination.path | str)
+and (.sources | type == "array" and length >= 1 and length <= 20)
+and all(.sources[];
+      type == "object" and (.id | str) and (.name | str)
+      and (.paths | strs and length >= 1 and length <= 50)
+      and ((.excludes // []) | strs and length <= 200)
+      and ((.hook // {}) | type == "object"
+           and ((.type // "none") | str)
+           and ((.container // "") | str)
+           and ((.appContainer // "") | str)))
+and ((.options // {}) | type == "object"
+     and ((.dryRun // false) | type == "boolean")
+     and ((.check // false) | type == "boolean")
+     and ((if has("cleanup") then .cleanup else true end) | type == "boolean")
+     and ((.keepLast // 2) | type == "number"))
+and ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
+JQ
+
+validate_job() {
+  local f=$1 remote rpath dry check cleanup keep n i id name ht hc ha p r e src sources='[]'
+  local -A seen=()
+  local -a paths rpaths excl
+
+  jq -e "$JOB_SHAPE" "$f" >/dev/null 2>&1 || fail "job is not valid JSON or has the wrong structure"
+
+  remote=$(jq -r '.destination.remote' "$f")
+  rpath=$(jq -r '.destination.path' "$f")
+  valid_remote "$remote"   || fail "invalid rclone remote name"
+  valid_repo_path "$rpath" || fail "invalid repository path (letters, digits, . _ / - only; no ..)"
+
+  dry=$(jq -r '.options.dryRun // false' "$f")
+  check=$(jq -r '.options.check // false' "$f")
+  cleanup=$(jq -r '(.options // {}) | if has("cleanup") then .cleanup else true end' "$f")
+  keep=$(jq -r --argjson d "$DEFAULT_KEEP_LAST" '.options.keepLast // $d' "$f")
+  if ! [[ $keep =~ $RE_UINT ]] || ((10#$keep < 1 || 10#$keep > 100)); then
+    fail "keepLast must be a whole number between 1 and 100"
+  fi
+  keep=$((10#$keep))
+
+  n=$(jq '.sources | length' "$f")
+  for ((i = 0; i < n; i++)); do
+    id=$(jq -r --argjson i "$i" '.sources[$i].id' "$f")
+    name=$(jq -r --argjson i "$i" '.sources[$i].name' "$f")
+    [[ $id =~ $RE_ID ]] || fail "invalid source id '$id' (1-40 chars: a-z 0-9 -)"
+    [[ -z ${seen[$id]:-} ]] || fail "duplicate source id '$id'"
+    seen[$id]=1
+    ((${#name} >= 1 && ${#name} <= 80)) || fail "source '$id': name must be 1-80 characters"
+
+    mapfile -t paths < <(jq -r --argjson i "$i" '.sources[$i].paths[]' "$f")
+    rpaths=()
+    for p in "${paths[@]}"; do
+      r=$(resolve_allowed "$p") || fail "source '$id': path is not inside an allowed root: $p"
+      [[ -e $r ]] || fail "source '$id': path does not exist: $r"
+      rpaths+=("$r")
+    done
+
+    mapfile -t excl < <(jq -r --argjson i "$i" '(.sources[$i].excludes // [])[]' "$f")
+    for e in "${excl[@]}"; do
+      [[ -n $e && ${#e} -le 4096 ]] || fail "source '$id': empty or too long exclude pattern"
+    done
+
+    ht=$(jq -r --argjson i "$i" '.sources[$i].hook.type // "none"' "$f")
+    hc=$(jq -r --argjson i "$i" '.sources[$i].hook.container // ""' "$f")
+    ha=$(jq -r --argjson i "$i" '.sources[$i].hook.appContainer // ""' "$f")
+    case $ht in
+      none) hc="" ha="" ;;
+      postgres|mariadb)
+        valid_container "$hc" || fail "source '$id': invalid database container name"
+        ha="" ;;
+      nextcloud)
+        hc=${hc:-nextcloud_db} ha=${ha:-nextcloud_app}
+        valid_container "$hc" || fail "source '$id': invalid database container name"
+        valid_container "$ha" || fail "source '$id': invalid app container name" ;;
+      *) fail "source '$id': unknown hook type (allowed: ${HOOK_TYPES[*]})" ;;
+    esac
+
+    src=$(jq -cn --arg id "$id" --arg name "$name" --arg ht "$ht" --arg hc "$hc" --arg ha "$ha" \
+      --argjson paths "$(json_array "${rpaths[@]}")" --argjson excludes "$(json_array "${excl[@]}")" \
+      '{id:$id, name:$name, paths:$paths, excludes:$excludes,
+        hook:{type:$ht, container:$hc, appContainer:$ha}}')
+    sources=$(jq -c --argjson s "$src" '. + [$s]' <<<"$sources")
+  done
+
+  jq -cn --arg remote "$remote" --arg path "$rpath" --argjson sources "$sources" \
+    --argjson dry "$dry" --argjson check "$check" --argjson cleanup "$cleanup" --argjson keep "$keep" \
+    '{destination:{remote:$remote, path:$path}, sources:$sources,
+      options:{dryRun:$dry, check:$check, cleanup:$cleanup, keepLast:$keep}}'
+}
+
+read_job_stdin() {   # → path of a temp file holding stdin (max 1 MiB)
+  local raw="$STATE_DIR/job.in.tmp"
+  head -c 1048577 >"$raw"
+  if (($(wc -c <"$raw") > 1048576)); then rm -f "$raw"; fail "job is too large"; fi
+  printf '%s\n' "$raw"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_info() {
+  local restic_v rclone_v jq_v docker=false mounted=false pw=false rc=false running=false
+  local -a containers=()
+  restic_v=$(restic version 2>/dev/null | head -n1 || true)
+  rclone_v=$(rclone version 2>/dev/null | head -n1 || true)
+  jq_v=$(jq --version 2>/dev/null || true)
+  if command -v docker >/dev/null; then
+    docker=true
+    mapfile -t containers < <(docker ps --format '{{.Names}}' 2>/dev/null | sort || true)
+  fi
+  if [[ -n $REQUIRED_MOUNT ]] && command -v mountpoint >/dev/null && mountpoint -q "$REQUIRED_MOUNT"; then
+    mounted=true
+  fi
+  if [[ -s $RESTIC_PASSWORD_FILE ]]; then pw=true; fi
+  if [[ -r $RCLONE_CONFIG ]]; then rc=true; fi
+  if job_running; then running=true; fi
+
+  jq -cn --arg v "$AGENT_VERSION" --arg host "$(uname -n)" --arg kernel "$(uname -r)" \
+    --arg restic "$restic_v" --arg rclone "$rclone_v" --arg jq "$jq_v" --argjson docker "$docker" \
+    --argjson roots "$(json_array "${ROOTS[@]}")" --arg mount "$REQUIRED_MOUNT" --argjson mounted "$mounted" \
+    --argjson pw "$pw" --argjson rcconf "$rc" --argjson running "$running" \
+    --argjson hooks "$(json_array "${HOOK_TYPES[@]}")" --argjson containers "$(json_array "${containers[@]}")" \
+    --arg dremote "$DEFAULT_REMOTE" --arg dpath "$DEFAULT_REPO_PATH" --argjson dkeep "$DEFAULT_KEEP_LAST" \
+    --arg staging "$STAGING_DIR" \
+    '{ok:true, agentVersion:$v, hostname:$host, kernel:$kernel,
+      restic:$restic, rclone:$rclone, jq:$jq, docker:$docker,
+      allowedRoots:$roots, requiredMount:$mount, mounted:$mounted,
+      passwordFile:$pw, rcloneConfig:$rcconf, stagingDir:$staging,
+      hooks:$hooks, containers:$containers, running:$running,
+      defaults:{remote:$dremote, path:$dpath, keepLast:$dkeep}}'
+}
+
+cmd_remotes() {
+  capture rclone listremotes --long || fail "rclone listremotes failed: $ERRTXT"
+  jq -cRn '{ok:true, remotes:[inputs | select(length > 0)
+            | capture("^(?<name>[^:]+):\\s*(?<type>\\S*)")]}' <<<"$OUT"
+}
+
+cmd_browse() {
+  local p=${1:-} r parent
+  local -a dirs=()
+  [[ -n $p ]] || p=${ROOTS[0]}
+  r=$(resolve_allowed "$p") || fail "path is not inside an allowed root"
+  [[ -d $r ]] || fail "not a directory: $r"
+  while IFS= read -r -d '' d; do dirs+=("$d"); done \
+    < <(find "$r" -mindepth 1 -maxdepth 1 -type d -printf '%f\0' 2>/dev/null | sort -z | head -z -n 2000)
+  parent=$(resolve_allowed "$(dirname -- "$r")") || parent=""
+  if [[ $parent == "$r" ]]; then parent=""; fi
+  jq -cn --arg path "$r" --arg parent "$parent" \
+    '{ok:true, path:$path, parent:(if $parent == "" then null else $parent end), dirs:$ARGS.positional}' \
+    --args "${dirs[@]}"
+}
+
+cmd_init() {
+  parse_repo_args "$@"
+  [[ -s $RESTIC_PASSWORD_FILE ]] || fail "password file $RESTIC_PASSWORD_FILE is missing"
+  capture restic -r "$REPO" init || fail "restic init failed: $ERRTXT"
+  jq -cn --arg repo "$REPO" --arg msg "$OUT" '{ok:true, repository:$repo, message:$msg}'
+}
+
+cmd_snapshots() {
+  parse_repo_args "$@"
+  local rc=0
+  capture restic -r "$REPO" --no-lock snapshots --json || rc=$?
+  if ((rc == 10)); then fail "repository $REPO does not exist (initialize it first)"; fi
+  ((rc == 0)) || fail "restic snapshots failed: $ERRTXT"
+  jq -c --arg repo "$REPO" '{ok:true, repository:$repo, snapshots:(. // [])}' <<<"$OUT"
+}
+
+cmd_validate() {
+  local raw job
+  raw=$(read_job_stdin) || exit 1
+  job=$(validate_job "$raw") || exit 1
+  rm -f "$raw"
+  jq -c '{ok:true, job:.}' <<<"$job"
+}
+
+cmd_start() {
+  local raw
+  raw=$(read_job_stdin) || exit 1
+  start_job "$raw" manual
+}
+
+# start_job RAW_JOB_FILE TRIGGER(manual|scheduled) — validate, write state, launch the unit.
+start_job() {
+  local raw=$1 trigger=$2 job run_id
+  exec 8>"$STATE_DIR/.start.lock"
+  flock -n 8 || fail "another start request is in progress"
+  if job_running; then fail "a backup is already running"; fi
+  if cli_lock_busy; then fail "another backup (pi-backup CLI?) is holding $LOCK_FILE"; fi
+
+  job=$(validate_job "$raw") || exit 1
+  rm -f "$raw"
+  printf '%s\n' "$job" >"$JOB_FILE.tmp"
+  mv -f "$JOB_FILE.tmp" "$JOB_FILE"
+
+  run_id=$(date +%Y%m%d-%H%M%S)
+  jq --arg id "$run_id" --arg now "$(now)" --arg trigger "$trigger" '
+    def step(id; name; kind): {id:id, name:name, kind:kind, status:"pending", message:"",
+                               startedAt:null, finishedAt:null, result:null};
+    . as $j |
+    {id:$id, status:"running", message:"Starting…", startedAt:$now, updatedAt:$now, finishedAt:null,
+     trigger:$trigger,
+     dryRun:$j.options.dryRun, options:$j.options, destination:$j.destination, currentStep:null,
+     steps: ([$j.sources[] | step(.id; .name; "backup")]
+             + (if $j.options.cleanup
+                then [step("cleanup"; "Clean up old backups (keep last \($j.options.keepLast))"; "cleanup")]
+                else [] end)
+             + (if $j.options.check
+                then [step("check"; "Verify repository (5% of data)"; "check")] else [] end))}' \
+    "$JOB_FILE" >"$STATE_FILE.tmp"
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+  rm -f "$PROGRESS_FILE"
+  if [[ -f $LOG_FILE ]]; then mv -f "$LOG_FILE" "$LOG_FILE.1"; fi
+  : >"$LOG_FILE"
+
+  systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+  if ! capture systemd-run --unit="$UNIT" --collect --quiet --description="Pi backup job" \
+      -p TimeoutStopSec=90 -p Nice=10 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=7 \
+      "$SELF" _run "$JOB_FILE"; then
+    state_update '.status="failed" | .message=$m | .finishedAt=$now | .steps |= map(.status="skipped")' --arg m "Could not launch job: $ERRTXT" || true
+    append_history
+    fail "could not launch job: $ERRTXT"
+  fi
+  jq -cn --arg id "$run_id" '{ok:true, runId:$id}'
+}
+
+cmd_status() {
+  local us running=false stale=false st age state progress='null' hist
+  us=$(unit_state)
+  if job_running; then running=true; fi
+  if [[ $running == false && -f $STATE_FILE ]]; then
+    st=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null || true)
+    if [[ $st == running ]]; then
+      age=$(($(date +%s) - $(stat -c %Y "$STATE_FILE")))
+      if ((age > 20)); then
+        stale=true
+        state_update '.status="failed"
+          | .message="The backup job stopped unexpectedly (Pi rebooted or the job was killed)."
+          | .finishedAt=$now
+          | .steps |= map(if .status == "running" then .status="failed"
+                          elif .status == "pending" then .status="skipped" else . end)' || true
+        append_history
+        rm -f "$PROGRESS_FILE"
+      fi
+    fi
+  fi
+  state=$(jq -c . "$STATE_FILE" 2>/dev/null || echo null)
+  [[ -n $state ]] || state=null
+  if [[ $running == true && -f $PROGRESS_FILE ]]; then
+    progress=$(jq -c . "$PROGRESS_FILE" 2>/dev/null || echo null)
+    [[ -n $progress ]] || progress=null
+  fi
+  hist=$(history_json 2>/dev/null || echo '[]')
+  jq -cn --arg unit "$us" --argjson running "$running" --argjson stale "$stale" \
+    --argjson state "$state" --argjson progress "$progress" --argjson history "$hist" \
+    '{ok:true, running:$running, unit:$unit, stale:$stale, state:$state, progress:$progress, history:$history}'
+}
+
+cmd_cancel() {
+  job_running || fail "no backup is running"
+  capture systemctl stop --no-block "$UNIT" || fail "could not stop job: $ERRTXT"
+  jq -cn '{ok:true, message:"Stopping the backup job…"}'
+}
+
+cmd_log() {
+  local n=${1:-200}
+  if ! [[ $n =~ $RE_UINT ]] || ((10#$n < 1 || 10#$n > 5000)); then fail "line count must be 1-5000"; fi
+  if [[ -f $LOG_FILE ]]; then tail -n "$((10#$n))" "$LOG_FILE"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Scheduled backups — a systemd timer runs "pi-backup-agent _scheduled", which
+# launches the stored job exactly like "start" does.
+# ---------------------------------------------------------------------------
+SCHED_FREQS=(daily every2days weekly monthly)
+WEEKDAYS=(Mon Tue Wed Thu Fri Sat Sun)
+RE_TIME='^([01][0-9]|2[0-3]):[0-5][0-9]$'
+EVERY2_MIN_GAP=129600   # 36 h: "every second day" skips if the last start is newer
+
+in_list() {
+  local v=$1 x
+  shift
+  for x in "$@"; do
+    if [[ $v == "$x" ]]; then return 0; fi
+  done
+  return 1
+}
+
+sched_calendar() {   # FREQ TIME WEEKDAY DAY → systemd OnCalendar expression
+  case $1 in
+    daily|every2days) printf '*-*-* %s:00\n' "$2" ;;
+    weekly)           printf '%s *-*-* %s:00\n' "$3" "$2" ;;
+    monthly)          printf '*-*-%02d %s:00\n' "$((10#$4))" "$2" ;;
+  esac
+}
+
+write_schedule_units() {   # write_schedule_units ONCALENDAR
+  local svc="$UNIT_DIR/$SCHED_UNIT.service" tmr="$UNIT_DIR/$SCHED_UNIT.timer"
+  mkdir -p "$UNIT_DIR"
+  cat >"$svc.tmp" <<EOF
+# Written by pi-backup-agent — change the schedule in the Pi Backup app.
+[Unit]
+Description=Pi backup — scheduled start
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF _scheduled
+EOF
+  cat >"$tmr.tmp" <<EOF
+# Written by pi-backup-agent — change the schedule in the Pi Backup app.
+[Unit]
+Description=Pi backup schedule
+
+[Timer]
+OnCalendar=$1
+Persistent=true
+AccuracySec=1min
+Unit=$SCHED_UNIT.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$svc.tmp" "$tmr.tmp"
+  mv -f "$svc.tmp" "$svc"
+  mv -f "$tmr.tmp" "$tmr"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+sched_record() {   # sched_record JQ_FILTER [jq args...] — update schedule-state.json
+  local filter=$1 cur='{}'
+  shift
+  if [[ -f $SCHED_STATE ]]; then cur=$(jq -c . "$SCHED_STATE" 2>/dev/null || echo '{}'); fi
+  jq -c "$@" --arg now "$(now)" "$filter" <<<"$cur" >"$SCHED_STATE.tmp" && mv -f "$SCHED_STATE.tmp" "$SCHED_STATE"
+}
+
+cmd_schedule() {
+  local sched='null' st='{}' active=false next="" next_epoch="" last="" e
+  if [[ -f $SCHEDULE_FILE ]]; then sched=$(jq -c . "$SCHEDULE_FILE" 2>/dev/null || echo null); fi
+  if [[ -f $SCHED_STATE ]]; then st=$(jq -c . "$SCHED_STATE" 2>/dev/null || echo '{}'); fi
+  if systemctl is-active --quiet "$SCHED_UNIT.timer" 2>/dev/null; then active=true; fi
+  next=$(systemctl show "$SCHED_UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null || true)
+  if [[ $active == true && -n $next && $next != n/a ]] && e=$(date -d "$next" +%s 2>/dev/null); then
+    next_epoch=$e
+    if [[ $(jq -r '.frequency // ""' <<<"$sched") == every2days ]]; then
+      last=$(jq -r '.lastStartEpoch // empty' <<<"$st")
+      if [[ -n $last ]] && ((next_epoch - last < EVERY2_MIN_GAP)); then next_epoch=$((next_epoch + 86400)); fi
+    fi
+  fi
+  jq -cn --argjson sched "$sched" --argjson st "$st" --argjson active "$active" \
+    --arg next "$([[ -n $next_epoch ]] && date -u -d "@$next_epoch" +%FT%TZ)" \
+    '{ok:true, schedule:$sched, active:$active,
+      nextRun:(if $next == "" then null else $next end), state:$st}'
+}
+
+cmd_schedule_set() {
+  local raw enabled freq time wd day job cal jobin="$STATE_DIR/sched-job.in.tmp"
+  raw=$(read_job_stdin) || exit 1
+  if ! jq -e 'type == "object" and (.enabled | type == "boolean")
+              and ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)' "$raw" >/dev/null 2>&1; then
+    rm -f "$raw"
+    fail "schedule must be a JSON object with a boolean 'enabled'"
+  fi
+  enabled=$(jq -r '.enabled' "$raw")
+  freq=$(jq -r '.frequency // "weekly"' "$raw")
+  time=$(jq -r '.time // "03:00"' "$raw")
+  wd=$(jq -r '.weekday // "Sun"' "$raw")
+  day=$(jq -r '.dayOfMonth // 1' "$raw")
+  in_list "$freq" "${SCHED_FREQS[@]}" || fail "frequency must be one of: ${SCHED_FREQS[*]}"
+  [[ $time =~ $RE_TIME ]] || fail "time must be HH:MM (24 h)"
+  in_list "$wd" "${WEEKDAYS[@]}" || fail "weekday must be one of: ${WEEKDAYS[*]}"
+  if ! [[ $day =~ $RE_UINT ]] || ((10#$day < 1 || 10#$day > 28)); then
+    fail "dayOfMonth must be 1-28 (so every month has it)"
+  fi
+  day=$((10#$day))
+
+  if jq -e '.job != null' "$raw" >/dev/null 2>&1; then
+    # Scheduled runs are always real backups.
+    jq '.job | .options = ((.options // {}) + {dryRun:false})' "$raw" >"$jobin" 2>/dev/null \
+      || fail "job must be an object"
+    job=$(validate_job "$jobin") || exit 1
+    rm -f "$jobin"
+  elif [[ -f $SCHEDULE_FILE ]]; then
+    job=$(jq -c '.job' "$SCHEDULE_FILE")
+  else
+    fail "a job is required for the first schedule"
+  fi
+  rm -f "$raw"
+
+  jq -cn --argjson enabled "$enabled" --arg freq "$freq" --arg time "$time" --arg wd "$wd" \
+    --argjson day "$day" --argjson job "$job" --arg now "$(now)" \
+    '{enabled:$enabled, frequency:$freq, time:$time, weekday:$wd, dayOfMonth:$day,
+      job:$job, updatedAt:$now}' >"$SCHEDULE_FILE.tmp"
+  mv -f "$SCHEDULE_FILE.tmp" "$SCHEDULE_FILE"
+
+  cal=$(sched_calendar "$freq" "$time" "$wd" "$day")
+  write_schedule_units "$cal"
+  if [[ $enabled == true ]]; then
+    capture systemctl enable "$SCHED_UNIT.timer" || fail "could not enable the timer: $ERRTXT"
+    capture systemctl restart "$SCHED_UNIT.timer" || fail "could not start the timer: $ERRTXT"
+  else
+    systemctl disable --now "$SCHED_UNIT.timer" >/dev/null 2>&1 || true
+  fi
+  cmd_schedule
+}
+
+cmd_scheduled() {
+  [[ -n ${INVOCATION_ID:-} ]] || fail "_scheduled is started by the systemd timer"
+  local freq last now_e raw out
+  if [[ ! -f $SCHEDULE_FILE || $(jq -r '.enabled' "$SCHEDULE_FILE" 2>/dev/null) != true ]]; then
+    jq -cn '{ok:true, skipped:true, reason:"schedule disabled"}'
+    return 0
+  fi
+  now_e=$(date +%s)
+  freq=$(jq -r '.frequency' "$SCHEDULE_FILE")
+  last=$(jq -r '.lastStartEpoch // empty' "$SCHED_STATE" 2>/dev/null || true)
+  if [[ $freq == every2days && -n $last ]] && ((now_e - last < EVERY2_MIN_GAP)); then
+    sched_record '.lastSkip = $now' || true
+    jq -cn '{ok:true, skipped:true, reason:"every second day"}'
+    return 0
+  fi
+  raw="$STATE_DIR/job.in.tmp"
+  jq '.job' "$SCHEDULE_FILE" >"$raw"
+  out=$(exec 3>&1; start_job "$raw" scheduled) || true
+  if [[ $(jq -r '.ok' <<<"$out" 2>/dev/null || true) == true ]]; then
+    sched_record '.lastStart = $now | .lastStartEpoch = $e | .lastRunId = $o.runId | .lastError = null' \
+      --argjson o "$out" --argjson e "$now_e" || true
+  else
+    sched_record '.lastAttempt = $now | .lastError = ($o.error? // "could not start")' \
+      --argjson o "$(jq -c . <<<"$out" 2>/dev/null || echo '{}')" || true
+  fi
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# _run — the job itself, executed inside the transient systemd unit
+# ---------------------------------------------------------------------------
+CANCELLED=0
+FATAL_MSG=""
+NC_MAINT_APP=""
+SUMMARY=""
+ERRCOUNT=0
+LAST_FATAL=""
+
+jopt() { jq -r "$1" "$JOB_FILE"; }
+
+step_set() {   # step_set INDEX STATUS MESSAGE
+  state_update '.steps[$i].status=$st | .steps[$i].message=$msg
+    | if $st == "running" then .steps[$i].startedAt=$now | .currentStep=$i
+      elif $st != "pending" then .steps[$i].finishedAt=$now else . end' \
+    --argjson i "$1" --arg st "$2" --arg msg "$3" || true
+}
+step_msg()    { state_update '.steps[$i].message=$msg' --argjson i "$1" --arg msg "$2" || true; }
+step_result() { state_update '.steps[$i].result=$r' --argjson i "$1" --argjson r "$2" || true; }
+
+write_progress() {   # write_progress INDEX NAME [STATUS_JSON]
+  local json=${3:-'{}'}
+  jq -c --argjson i "$1" --arg name "$2" --arg now "$(now)" --argjson indet "$([[ -z ${3:-} ]] && echo true || echo false)" '
+    {step:$i, stepName:$name, indeterminate:$indet,
+     percent:(if $indet then null else ((.percent_done // 0) * 100) end),
+     bytesDone:(.bytes_done // 0), totalBytes:(.total_bytes // 0),
+     filesDone:(.files_done // 0), totalFiles:(.total_files // 0),
+     elapsed:(.seconds_elapsed // 0), eta:(.seconds_remaining // null),
+     currentFile:((.current_files // [])[0] // null), errorCount:(.error_count // 0),
+     updatedAt:$now}' <<<"$json" >"$PROGRESS_FILE.tmp" 2>/dev/null \
+    && mv -f "$PROGRESS_FILE.tmp" "$PROGRESS_FILE"
+}
+
+# run_restic_json INDEX NAME RESTIC_ARGS... — parses restic --json output; returns restic's exit code
+run_restic_json() {
+  local i=$1 name=$2 line mt
+  shift 2
+  SUMMARY="" ERRCOUNT=0 LAST_FATAL=""
+  restic "$@" 2>&1 | while IFS= read -r line; do
+    if [[ $line == '{'* ]]; then
+      mt=$(jq -r '.message_type // empty' <<<"$line" 2>/dev/null || true)
+      case $mt in
+        status)  write_progress "$i" "$name" "$line" ;;
+        summary) SUMMARY=$line ;;
+        error)
+          ERRCOUNT=$((ERRCOUNT + 1))
+          log "restic error: $(jq -r '[(.error | if type == "object" then .message else tostring end),
+                                       (.item // empty)] | join(" — ")' <<<"$line" 2>/dev/null || echo "$line")" ;;
+        exit_error)
+          LAST_FATAL=$(jq -r '.message // empty' <<<"$line" 2>/dev/null || true)
+          log "restic: $LAST_FATAL" ;;
+        verbose_status) ;;
+        *) log "$line" ;;
+      esac
+    elif [[ -n $line ]]; then
+      log "$line"
+      if [[ $line == Fatal:* ]]; then LAST_FATAL=$line; fi
+    fi
+  done
+  return "${PIPESTATUS[0]}"
+}
+
+container_running() { [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
+
+occ_maintenance() {   # occ_maintenance APP on|off
+  docker exec -u www-data "$1" php occ maintenance:mode "--$2" >>"$LOG_FILE" 2>&1
+}
+
+nc_maintenance_off() {
+  if [[ -n $NC_MAINT_APP ]]; then
+    log "Turning Nextcloud maintenance mode OFF"
+    if occ_maintenance "$NC_MAINT_APP" off; then
+      NC_MAINT_APP=""
+    else
+      log "WARNING: could not disable maintenance mode — run: docker exec -u www-data $NC_MAINT_APP php occ maintenance:mode --off"
+    fi
+  fi
+}
+
+finish_dump() {   # finish_dump OUTFILE
+  if [[ -s $1.tmp ]]; then mv -f "$1.tmp" "$1"; return 0; fi
+  rm -f "$1.tmp"
+  log "Database dump is empty"
+  return 1
+}
+
+dump_postgres() {   # dump_postgres CONTAINER OUTFILE
+  log "Dumping PostgreSQL in $1"
+  # The sh -c script is a constant; the container name is passed as argv.
+  # shellcheck disable=SC2016
+  docker exec "$1" sh -c 'exec pg_dumpall --clean --if-exists --username="$POSTGRES_USER"' \
+    >"$2.tmp" 2>>"$LOG_FILE" || { rm -f "$2.tmp"; return 1; }
+  finish_dump "$2"
+}
+
+dump_mariadb() {   # dump_mariadb CONTAINER OUTFILE
+  log "Dumping MariaDB in $1"
+  # shellcheck disable=SC2016
+  docker exec "$1" sh -c 'exec mariadb-dump --single-transaction --all-databases --routines --events --default-character-set=utf8mb4 -u root -p"$MARIADB_ROOT_PASSWORD"' \
+    >"$2.tmp" 2>>"$LOG_FILE" || { rm -f "$2.tmp"; return 1; }
+  finish_dump "$2"
+}
+
+run_source() {   # run_source INDEX  → 0 if a snapshot was written (done/warning)
+  local i=$1 id name ht hc ha dump="" p rc msg
+  local -a paths excl args
+  id=$(jopt ".sources[$i].id")
+  name=$(jopt ".sources[$i].name")
+  ht=$(jopt ".sources[$i].hook.type")
+  hc=$(jopt ".sources[$i].hook.container")
+  ha=$(jopt ".sources[$i].hook.appContainer")
+  mapfile -t paths < <(jopt ".sources[$i].paths[]")
+  mapfile -t excl < <(jopt ".sources[$i].excludes[]")
+
+  log "=== $name ($id) ==="
+  step_set "$i" running "Preparing"
+  write_progress "$i" "$name"
+
+  for p in "${paths[@]}"; do
+    if [[ ! -e $p ]]; then step_set "$i" failed "Path no longer exists: $p"; return 1; fi
+  done
+
+  if [[ $DRY == true && $ht != none ]]; then
+    log "Dry run: skipping the $ht database hook"
+    ht=none
+  fi
+
+  case $ht in
+    postgres)
+      step_msg "$i" "Dumping PostgreSQL database ($hc)"
+      container_running "$hc" || { step_set "$i" failed "Container $hc is not running"; return 1; }
+      dump="$STAGING_DIR/$id-db.sql"
+      dump_postgres "$hc" "$dump" || { step_set "$i" failed "Database dump failed (see log)"; return 1; } ;;
+    mariadb)
+      step_msg "$i" "Dumping MariaDB database ($hc)"
+      container_running "$hc" || { step_set "$i" failed "Container $hc is not running"; return 1; }
+      dump="$STAGING_DIR/$id-db.sql"
+      dump_mariadb "$hc" "$dump" || { step_set "$i" failed "Database dump failed (see log)"; return 1; } ;;
+    nextcloud)
+      container_running "$ha" || { step_set "$i" failed "Container $ha is not running"; return 1; }
+      container_running "$hc" || { step_set "$i" failed "Container $hc is not running"; return 1; }
+      step_msg "$i" "Enabling Nextcloud maintenance mode"
+      log "Turning Nextcloud maintenance mode ON"
+      occ_maintenance "$ha" on || { step_set "$i" failed "Could not enable maintenance mode (see log)"; return 1; }
+      NC_MAINT_APP=$ha
+      step_msg "$i" "Dumping Nextcloud database ($hc)"
+      dump="$STAGING_DIR/$id-db.sql"
+      if ! dump_mariadb "$hc" "$dump"; then
+        nc_maintenance_off
+        step_set "$i" failed "Database dump failed (see log)"
+        return 1
+      fi ;;
+  esac
+
+  args=(backup --json --tag "$id" --pack-size 64 --exclude-caches)
+  if [[ $DRY == true ]]; then args+=(--dry-run); fi
+  for p in "${excl[@]}"; do args+=("--exclude=$p"); done
+  args+=(-- "${paths[@]}")
+  if [[ -n $dump ]]; then args+=("$dump"); fi
+
+  step_msg "$i" "$([[ $DRY == true ]] && echo "Scanning (dry run)" || echo "Uploading")"
+  log "restic backup of ${#paths[@]} path(s)${dump:+ + database dump}"
+  rc=0
+  run_restic_json "$i" "$name" "${args[@]}" || rc=$?
+  nc_maintenance_off
+
+  if [[ -n $SUMMARY ]]; then
+    step_result "$i" "$(jq -c '{filesNew:.files_new, filesChanged:.files_changed,
+        filesUnmodified:.files_unmodified, dataAdded:.data_added,
+        dataAddedPacked:(.data_added_packed // null), totalFiles:.total_files_processed,
+        totalBytes:.total_bytes_processed, duration:.total_duration,
+        snapshotId:(.snapshot_id // null), dryRun:(.dry_run // false)}' <<<"$SUMMARY" 2>/dev/null || echo null)"
+  fi
+  case $rc in
+    0)
+      msg=$([[ $DRY == true ]] && echo "Dry run complete" || echo "Snapshot saved")
+      step_set "$i" "done" "$msg"; return 0 ;;
+    3)
+      step_set "$i" warning "Snapshot saved, but $ERRCOUNT file(s) could not be read (see log)"; return 0 ;;
+    *)
+      step_set "$i" failed "restic failed (exit $rc)${LAST_FATAL:+: $LAST_FATAL}"; return 1 ;;
+  esac
+}
+
+run_preflight() {
+  local c
+  for c in restic rclone jq; do
+    command -v "$c" >/dev/null || { FATAL_MSG="'$c' is not installed"; return 1; }
+  done
+  if jq -e '[.sources[].hook.type] | any(. != "none")' "$JOB_FILE" >/dev/null; then
+    command -v docker >/dev/null || { FATAL_MSG="'docker' is not installed"; return 1; }
+  fi
+  if [[ -n $REQUIRED_MOUNT ]] && ! mountpoint -q "$REQUIRED_MOUNT"; then
+    FATAL_MSG="$REQUIRED_MOUNT is not mounted — refusing to back up an empty directory"; return 1
+  fi
+  [[ -s $RESTIC_PASSWORD_FILE ]] || { FATAL_MSG="Password file $RESTIC_PASSWORD_FILE is missing"; return 1; }
+  [[ -r $RCLONE_CONFIG ]] || { FATAL_MSG="rclone config $RCLONE_CONFIG is missing"; return 1; }
+  mkdir -p "$STAGING_DIR" "$CACHE_DIR"
+  chmod 700 "$STAGING_DIR" "$CACHE_DIR"
+}
+
+run_finish() {
+  local rc=$?
+  trap - TERM INT HUP
+  nc_maintenance_off
+  rm -f "$STAGING_DIR"/*.tmp "$STATE_DIR"/*.tmp "$STATE_FILE".tmp.* 2>/dev/null
+  state_update '
+    .steps |= map(if .status == "running"
+                  then .status = (if $cancelled then "cancelled" else "failed" end) | .finishedAt = $now
+                  elif .status == "pending" then .status = "skipped" else . end)
+    | .status = (if $cancelled then "cancelled"
+                 elif $fatal != "" or $rc != 0 then "failed"
+                 elif any(.steps[]; .status == "failed") then "failed"
+                 elif any(.steps[]; .status == "warning") then "warning"
+                 else "success" end)
+    | .message = (if $cancelled then "Cancelled"
+                  elif $fatal != "" then $fatal
+                  elif $rc != 0 then "The job exited unexpectedly (exit \($rc))"
+                  elif .status == "failed" then "Some steps failed — see the log"
+                  elif .status == "warning" then "Completed with warnings"
+                  elif .dryRun then "Dry run completed"
+                  else "Backup completed" end)
+    | .finishedAt = $now | .currentStep = null' \
+    --argjson cancelled "$([[ $CANCELLED -eq 1 ]] && echo true || echo false)" \
+    --arg fatal "$FATAL_MSG" --argjson rc "$rc" || true
+  append_history || true
+  rm -f "$PROGRESS_FILE"
+  log "Finished: $(jq -r '.status + " — " + .message' "$STATE_FILE" 2>/dev/null || echo "rc=$rc")"
+}
+
+cmd_run() {
+  [[ ${1:-} == "$JOB_FILE" ]] || fail "_run is internal"
+  [[ -n ${INVOCATION_ID:-} ]] || fail "_run must be started by systemd-run"
+  set +e
+  trap - ERR
+
+  local n i cleanup check keep idx rc
+  local -a ok_tags=() args
+
+  trap 'CANCELLED=1; log "Received stop signal — cancelling"; exit 143' TERM INT HUP
+  trap run_finish EXIT
+
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then FATAL_MSG="Another backup is holding $LOCK_FILE"; exit 1; fi
+
+  DRY=$(jopt '.options.dryRun')
+  cleanup=$(jopt '.options.cleanup')
+  check=$(jopt '.options.check')
+  keep=$(jopt '.options.keepLast')
+  n=$(jopt '.sources | length')
+  RESTIC_REPOSITORY="rclone:$(jopt '.destination.remote'):$(jopt '.destination.path')"
+  export RESTIC_REPOSITORY
+
+  log "Backup started (repository $RESTIC_REPOSITORY, dry run: $DRY, cleanup: $cleanup keep $keep, check: $check)"
+  state_update '.message="Checking repository…"' || true
+  run_preflight || exit 1
+
+  if ! capture restic cat config; then
+    FATAL_MSG="Cannot open the repository $RESTIC_REPOSITORY (network, rclone token, password, or not initialized?): $ERRTXT"
+    exit 1
+  fi
+  state_update '.message="Running"' || true
+
+  for ((i = 0; i < n; i++)); do
+    if run_source "$i"; then ok_tags+=("$(jopt ".sources[$i].id")"); fi
+  done
+
+  idx=$n
+  if [[ $cleanup == true ]]; then
+    if ((${#ok_tags[@]} == 0)); then
+      step_set "$idx" skipped "No successful backups — nothing cleaned up"
+    else
+      step_set "$idx" running "Removing backups older than the last $keep"
+      write_progress "$idx" "Clean up"
+      log "=== Clean up: keep last $keep per source (${ok_tags[*]}) ==="
+      args=(forget --group-by "host,tags" --keep-last "$keep" --prune)
+      for i in "${ok_tags[@]}"; do args+=(--tag "$i"); done
+      if [[ $DRY == true ]]; then args+=(--dry-run); fi
+      rc=0
+      restic "${args[@]}" >>"$LOG_FILE" 2>&1 || rc=$?
+      if ((rc == 0)); then
+        step_set "$idx" "done" "$([[ $DRY == true ]] && echo "Dry run: nothing removed (see log)" || echo "Kept the last $keep backup(s) per source")"
+      else
+        step_set "$idx" failed "restic forget/prune failed (exit $rc, see log)"
+      fi
+    fi
+    idx=$((idx + 1))
+  fi
+
+  if [[ $check == true ]]; then
+    step_set "$idx" running "Reading a random 5% of the stored data"
+    write_progress "$idx" "Verify"
+    log "=== Verifying repository (structure + random 5% of data) ==="
+    rc=0
+    restic check --read-data-subset=5% >>"$LOG_FILE" 2>&1 || rc=$?
+    if ((rc == 0)); then step_set "$idx" "done" "Repository is healthy"
+    else step_set "$idx" failed "restic check reported problems (exit $rc, see log)"; fi
+  fi
+  exit 0
+}
+
+usage() {
+  sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//' >&2
+  fail "usage: pi-backup-agent <info|remotes|browse|init|validate|start|status|cancel|log|snapshots|schedule|schedule-set>"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  exec 3>&1
+  local cmd=${1:-}
+  if (($# > 0)); then shift; fi
+  if [[ $EUID -ne 0 && -z ${PI_BACKUP_AGENT_CONF:-} ]]; then fail "must run as root (sudo)"; fi
+  ensure_dirs
+  if [[ $cmd == _run ]]; then cmd_run "$@"; fi   # never returns
+  trap 'fail "internal error in pi-backup-agent (line $LINENO)"' ERR
+  case $cmd in
+    info)      cmd_info ;;
+    remotes)   cmd_remotes ;;
+    browse)    cmd_browse "${1:-}" ;;
+    init)      cmd_init "$@" ;;
+    validate)  cmd_validate ;;
+    start)     cmd_start ;;
+    status)    cmd_status ;;
+    cancel)    cmd_cancel ;;
+    log)       cmd_log "${1:-200}" ;;
+    snapshots) cmd_snapshots "$@" ;;
+    schedule)  cmd_schedule ;;
+    schedule-set) cmd_schedule_set ;;
+    _scheduled) cmd_scheduled ;;
+    *)         usage ;;
+  esac
+}
+
+main "$@"

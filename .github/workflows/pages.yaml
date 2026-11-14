@@ -1,0 +1,75 @@
+name: Pages
+
+# Deploys the website in site/ to GitHub Pages.
+#
+# One-time manual step: in the repository's Settings → Pages, set
+# "Build and deployment → Source" to "GitHub Actions". Until then deploy-pages
+# fails with "Pages site not found".
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'test/screenshots/goldens/**'
+      - 'tool/sync_site_images.sh'
+      - 'tool/check_site.sh'
+      - '.github/workflows/pages.yaml'
+      - '.github/workflows/release.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Copy the screenshots out of the golden tests
+        run: ./tool/sync_site_images.sh
+
+      - name: Check the site
+        run: ./tool/check_site.sh
+
+      - name: Compress the screenshots (lossless)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y optipng
+          optipng -quiet -o2 site/img/*.png
+
+      # "|" as the sed delimiter because a repository name contains "/".
+      - name: Point the site at this repository
+        run: |
+          grep -rl '__REPO__\|__BASE_URL__' site \
+            | xargs -r sed -i \
+                -e "s|__REPO__|${{ github.repository }}|g" \
+                -e "s|__BASE_URL__|${{ steps.pages.outputs.base_url }}|g"
+          sed -i -e "s|__BUILD_SHA__|${GITHUB_SHA}|g" -e "s|__BUILD__|${GITHUB_SHA::7}|g" site/index.html
+
+      - name: Confirm no placeholder survived
+        run: |
+          if grep -rq '__REPO__\|__BASE_URL__\|__BUILD' site; then
+            grep -rn '__REPO__\|__BASE_URL__\|__BUILD' site >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
