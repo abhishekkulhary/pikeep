@@ -60,12 +60,41 @@ jobs:
           cache: true
       - run: bash tool/setup_platforms.sh
       - run: flutter pub get
+      # A stable upload key lets each APK install over the previous one.
+      # Without the secrets the build falls back to a throwaway debug key
+      # (see android/app/build.gradle.kts).
+      - name: Configure release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64$KEYSTORE_PASSWORD$KEY_ALIAS$KEY_PASSWORD" ]; then
+            echo "::warning title=Unsigned APK::ANDROID_KEYSTORE_* secrets not set; signing with a debug key. Releases won't update in place."
+            exit 0
+          fi
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Set all four secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD."
+            exit 1
+          fi
+          KEYSTORE="$RUNNER_TEMP/release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode > "$KEYSTORE"
+          {
+            echo "storeFile=$KEYSTORE"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
       # One universal APK: someone sideloading wants the single file that works.
-      # Signed with the debug key until a release keystore is set up.
       - run: flutter build apk --release
-      - run: |
+      - name: Name the APK and log its signing certificate
+        run: |
           mkdir -p dist
           cp build/app/outputs/flutter-apk/app-release.apk dist/PiKeep-android-universal.apk
+          # Logged so consecutive releases can be compared: same SHA-256 = updates install in place.
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --print-certs dist/PiKeep-android-universal.apk | grep -E 'DN|SHA-256'
       - uses: actions/upload-artifact@v4
         with:
           name: android

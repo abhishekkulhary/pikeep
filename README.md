@@ -110,6 +110,13 @@ APK, an unsigned iOS build and the Pi agent tarball, and publishes them under
 fixed names that the website's download buttons use. The macOS and Windows
 builds are unsigned; the website explains how to open them.
 
+The Android APK is signed with the upload key from four repository secrets —
+`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`,
+`ANDROID_KEY_PASSWORD` — which the workflow writes to `android/key.properties`
+(never committed; see `android/key.properties.example`). Without them it falls
+back to the debug key and warns "Unsigned APK". Every update must be signed with
+the same key, or it will not install over the previous version.
+
 GitHub Pages needs one manual step: **Settings → Pages → Source: GitHub Actions**.
 
 ## License
