@@ -54,3 +54,7 @@ failures/
 
 # Local planning notes (contain private host names)
 HANDOFF.md
+
+# Copies the Nextcloud sync makes of folders ("Configs 2", "Base 2.lproj")
+**/* [0-9]/
+**/* [0-9].*/

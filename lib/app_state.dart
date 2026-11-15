@@ -46,6 +46,43 @@ class AppState extends ChangeNotifier {
       (scheduleInfo?['state'] as Map<String, dynamic>?) ?? const {};
 
   bool get running => status?['running'] == true;
+
+  /// Asks the shell to switch tabs (e.g. to Backup after starting a restore).
+  final tabRequest = ValueNotifier<int?>(null);
+
+  Map<String, dynamic> get health => (status?['health'] as Map<String, dynamic>?) ?? const {};
+  bool get diskMounted => health['mounted'] != false && info?['mounted'] != false;
+  bool get alertsOn => health['alerts'] == true;
+
+  /// Kind of the current/last job: "backup" or "restore".
+  String get jobKind => (jobState?['kind'] as String?) ?? 'backup';
+
+  /// Finish time of the last real (non-dry-run) backup that completed.
+  DateTime? get lastGoodBackup {
+    for (final h in history) {
+      final kind = (h['kind'] as String?) ?? 'backup';
+      if (kind == 'backup' && h['dryRun'] != true && (h['status'] == 'success' || h['status'] == 'warning')) {
+        return DateTime.tryParse((h['finishedAt'] ?? h['startedAt'] ?? '') as String);
+      }
+    }
+    return null;
+  }
+
+  /// How long without a completed backup counts as overdue: twice the schedule's
+  /// interval, or 8 days without a schedule.
+  Duration get overdueAfter => switch (scheduleActive ? schedule.frequency : null) {
+        ScheduleFrequency.daily => const Duration(days: 2),
+        ScheduleFrequency.every2days => const Duration(days: 4),
+        ScheduleFrequency.weekly => const Duration(days: 14),
+        ScheduleFrequency.monthly => const Duration(days: 62),
+        null => const Duration(days: 8),
+      };
+
+  bool get backupOverdue {
+    final last = lastGoodBackup;
+    if (last == null) return history.isNotEmpty || scheduleActive;
+    return DateTime.now().difference(last) > overdueAfter;
+  }
   Map<String, dynamic>? get jobState => status?['state'] as Map<String, dynamic>?;
   Map<String, dynamic>? get progress => status?['progress'] as Map<String, dynamic>?;
   List<Map<String, dynamic>> get history =>
@@ -271,6 +308,34 @@ class AppState extends ChangeNotifier {
   void setDryRun(bool v) {
     dryRun = v;
     notifyListeners();
+  }
+
+  // ---- restore and safety ---------------------------------------------------------
+
+  /// Returns null on success, otherwise an error message.
+  Future<String?> startRestore(String snapshotId, {required List<String> paths, required bool inPlace}) async {
+    busy = true;
+    notifyListeners();
+    try {
+      await agent.restore(destination, snapshotId, paths: paths, inPlace: inPlace);
+      await refreshStatus();
+      tabRequest.value = 0;
+      return null;
+    } catch (e) {
+      return e.toString();
+    } finally {
+      busy = false;
+      notifyListeners();
+    }
+  }
+
+  Future<String?> acceptShrink(String sourceId) async {
+    try {
+      await agent.acceptShrink(destination, sourceId);
+      return null;
+    } catch (e) {
+      return e.toString();
+    }
   }
 
   // ---- automatic backups ------------------------------------------------------

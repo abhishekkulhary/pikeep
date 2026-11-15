@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:material_ui/material_ui.dart';
 
 import '../app_state.dart';
@@ -24,6 +26,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final _passphrase = TextEditingController();
   late final _repoPath = TextEditingController();
   late final _keep = TextEditingController();
+  late final _alertUrl = TextEditingController();
+  bool _alertsLoaded = false;
+  bool _alertsFromConfig = false;
+  bool _alertBusy = false;
   bool _showPassword = false;
   bool _testing = false;
   bool _loadingRemotes = false;
@@ -56,7 +62,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     state.removeListener(_fillOnce);
-    for (final c in [_host, _port, _user, _password, _key, _passphrase, _repoPath, _keep]) {
+    for (final c in [_host, _port, _user, _password, _key, _passphrase, _repoPath, _keep, _alertUrl]) {
       c.dispose();
     }
     super.dispose();
@@ -137,6 +143,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (ok) await state.forgetHostKey();
   }
 
+  Future<void> _loadAlerts() async {
+    try {
+      final n = await state.agent.notifyGet();
+      if (!mounted) return;
+      setState(() {
+        _alertUrl.text = n.url;
+        _alertsFromConfig = n.fromConfig;
+        _alertsLoaded = true;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _alertsLoaded = true);
+    }
+  }
+
+  Future<void> _alertAction(Future<void> Function() action, String done) async {
+    setState(() => _alertBusy = true);
+    try {
+      await action();
+      if (mounted) showSnack(context, done);
+      await state.refreshStatus();
+    } catch (e) {
+      if (mounted) showSnack(context, e.toString(), error: true);
+    } finally {
+      if (mounted) setState(() => _alertBusy = false);
+    }
+  }
+
+  void _generateTopic() {
+    const chars = 'abcdefghijkmnpqrstuvwxyz23456789';
+    final r = Random.secure();
+    final topic = List.generate(20, (_) => chars[r.nextInt(chars.length)]).join();
+    setState(() => _alertUrl.text = 'https://ntfy.sh/pikeep-$topic');
+  }
+
   void _setKeep(int v) {
     final k = v.clamp(Retention.minKeep, Retention.maxKeep);
     _keep.text = '$k';
@@ -154,6 +194,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _connectionCard(mono),
           _destinationCard(),
           _retentionCard(),
+          if (state.connState == ConnState.connected) _alertsCard(),
           if (state.info != null) _aboutCard(),
         ]),
       ),
@@ -366,6 +407,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Text('Clean-up only touches sources whose backup succeeded in that run, '
             'so a failed backup never deletes your older good copies.'),
       ),
+    ]);
+  }
+
+  Widget _alertsCard() {
+    if (!_alertsLoaded && !_alertBusy) {
+      _alertBusy = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await _loadAlerts();
+        if (mounted) setState(() => _alertBusy = false);
+      });
+    }
+    final small = Theme.of(context).textTheme.bodySmall;
+    return SectionCard(title: 'Alerts', padding: const EdgeInsets.fromLTRB(16, 8, 16, 16), children: [
+      Text(
+        'Get a push notification when a backup fails, the disk is missing, or a source suddenly shrinks — '
+        'the Pi sends it, so it works while the app is closed. Uses ntfy: install the ntfy app on your '
+        'phone, subscribe to the same topic, and keep the topic name secret (anyone who knows it can read the alerts).',
+        style: small,
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _alertUrl,
+        enabled: !_alertsFromConfig,
+        autocorrect: false,
+        keyboardType: TextInputType.url,
+        decoration: InputDecoration(
+          labelText: 'Alert URL',
+          hintText: 'https://ntfy.sh/your-secret-topic',
+          helperText: _alertsFromConfig ? 'Set in /etc/pi-backup/agent.conf on the Pi' : 'Leave empty to turn alerts off',
+          suffixIcon: _alertsFromConfig
+              ? null
+              : IconButton(tooltip: 'Generate a private topic', icon: const Icon(Icons.casino_outlined), onPressed: _generateTopic),
+        ),
+      ),
+      const SizedBox(height: 12),
+      Wrap(spacing: 12, runSpacing: 8, children: [
+        FilledButton.tonal(
+          onPressed: _alertBusy || _alertsFromConfig
+              ? null
+              : () => _alertAction(() => state.agent.notifySet(_alertUrl.text.trim()),
+                  _alertUrl.text.trim().isEmpty ? 'Alerts turned off' : 'Alert URL saved on the Pi'),
+          child: const Text('Save'),
+        ),
+        OutlinedButton.icon(
+          onPressed: _alertBusy ? null : () => _alertAction(state.agent.notifyTest, 'Test alert sent — check your phone'),
+          icon: const Icon(Icons.notifications_active_outlined),
+          label: const Text('Send test'),
+        ),
+      ]),
     ]);
   }
 

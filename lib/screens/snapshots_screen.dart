@@ -3,6 +3,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app_state.dart';
 import '../format.dart';
 import '../widgets.dart';
+import 'snapshot_screen.dart';
 
 class SnapshotsScreen extends StatefulWidget {
   const SnapshotsScreen({super.key, required this.state, required this.visible});
@@ -78,6 +79,9 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
         if (_loading) const LinearProgressIndicator(),
         Text('${widget.state.destination.label} · $total snapshot(s) · '
             '${r.cleanup ? 'keeping last ${r.keepLast} per source' : 'automatic clean-up off'}'),
+        if (total > 0)
+          Text('Tap a snapshot to browse it and restore files.',
+              style: Theme.of(context).textTheme.bodySmall),
         if (_error != null) Notice(_error!),
         if (!_loadedOnce && !_loading)
           Center(
@@ -110,6 +114,11 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
         if (outside)
           Text('Will be deleted by the next clean-up', style: TextStyle(color: cs.error, fontSize: 12)),
       ]),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => SnapshotScreen(state: widget.state, snapshot: s)),
+      ),
     );
   }
 }

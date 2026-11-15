@@ -50,9 +50,9 @@
       <h1>Your Pi backs itself up. <em>You just press start.</em></h1>
       <p class="lead">
         PiKeep is a remote control for the backup job on your Raspberry Pi.
-        Choose what to back up, start it or put it on a schedule, and watch
+        Choose what to back up, start it or put it on a schedule, watch
         encrypted snapshots of your photos, files and databases upload to
-        OneDrive — while the Pi does all the work.
+        OneDrive — and restore them from the same app. The Pi does all the work.
       </p>
       <div class="cta">
         <a class="btn" href="#download">
@@ -145,11 +145,11 @@
         </p>
       </article>
       <article class="card">
-        <h3>Keep the last N</h3>
+        <h3>Keep the last N — safely</h3>
         <p>
-          Old snapshots are cleaned up automatically — two per source by
-          default, configurable. Only sources that backed up successfully are
-          ever pruned.
+          Old snapshots are cleaned up automatically, but never because of a
+          bad run: unreadable files, or a source that suddenly shrank to a
+          fraction of its size, keep every older backup until you say so.
         </p>
       </article>
       <article class="card">
@@ -178,6 +178,30 @@
         <p>
           Every snapshot per source with its size, and a marker on the ones
           the next clean-up will remove.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Restore from the app</h3>
+        <p>
+          Browse any snapshot, pick files or folders, and restore them to a
+          separate folder — or the whole snapshot back in place onto a
+          replacement disk. It runs on the Pi, with live progress.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Alerts when it matters</h3>
+        <p>
+          A push notification through ntfy when a backup fails, the disk is
+          missing or a source shrinks — sent by the Pi, so you hear about it
+          without opening the app.
+        </p>
+      </article>
+      <article class="card">
+        <h3>A dead disk stops backups</h3>
+        <p>
+          If the backup disk is not mounted the Pi refuses to run and deletes
+          nothing; the app shows it on the first screen, and a restore guide
+          walks you through the rebuild.
         </p>
       </article>
     </div>

@@ -17,6 +17,10 @@
 #   snapshots --remote R --path P         restic snapshots
 #   schedule                              automatic-backup schedule, next run, last result
 #   schedule-set                          set the schedule (JSON on stdin)
+#   snapshot-ls --remote R --path P --id ID [--dir D]   browse a snapshot
+#   restore                               restore a snapshot (JSON on stdin), runs like a backup
+#   accept-shrink --remote R --path P --tag ID          accept that a source is smaller now
+#   notify | notify-set | notify-test     alert URL (ntfy-style) for failures
 #
 # The agent runs as root with network-supplied input: every value is validated and
 # passed as argv; nothing user-supplied is ever evaluated by a shell.
@@ -53,6 +57,9 @@ LOCK_FILE="/run/pi-backup.lock"   # shared with the pi-backup CLI script
 DEFAULT_REMOTE="onedrive"
 DEFAULT_REPO_PATH="pi-backup"
 DEFAULT_KEEP_LAST=2
+RESTORE_DIR=""            # where "restore to a separate folder" writes; default <REQUIRED_MOUNT>/restore
+SHRINK_GUARD_PERCENT=50   # keep old backups if a source shrinks below this % of its largest backup; 0 = off
+NOTIFY_URL=""             # ntfy-style alert URL; the app can also set one (state dir notify.json)
 UNIT="pi-backup-job"
 SCHED_UNIT="pi-backup-schedule"
 UNIT_DIR="/etc/systemd/system"
@@ -74,9 +81,13 @@ LOG_FILE="$STATE_DIR/job.log"
 HISTORY_FILE="$STATE_DIR/history.jsonl"
 SCHEDULE_FILE="$STATE_DIR/schedule.json"
 SCHED_STATE="$STATE_DIR/schedule-state.json"
+NOTIFY_FILE="$STATE_DIR/notify.json"
+ACCEPT_FILE="$STATE_DIR/shrink-accepted.json"
 
 read -r -a ROOTS <<<"$ALLOWED_ROOTS"
 HOOK_TYPES=(none postgres mariadb nextcloud)
+[[ -n $RESTORE_DIR ]] || RESTORE_DIR="${REQUIRED_MOUNT:-${ROOTS[0]}}/restore"
+[[ $SHRINK_GUARD_PERCENT =~ ^[0-9]{1,2}$ ]] || SHRINK_GUARD_PERCENT=50
 
 RE_ID='^[a-z0-9-]{1,40}$'
 RE_REMOTE='^[A-Za-z0-9_-]{1,64}$'
@@ -84,6 +95,8 @@ RE_REPO='^[A-Za-z0-9._/-]{1,200}$'
 RE_DOTDOT='(^|/)\.\.(/|$)'
 RE_CONTAINER='^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$'
 RE_UINT='^[0-9]{1,6}$'
+RE_SNAP='^[0-9a-f]{8,64}$'
+RE_URL='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,6 +107,39 @@ now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 fail() { jq -cn --arg e "$1" '{ok:false,error:$e}' >&3; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
 json_array() { jq -cn '$ARGS.positional' --args "$@"; }
+
+# A path inside a snapshot: absolute, printable, no "..". (It is not a path on
+# this machine — where it may be written is decided separately.)
+valid_snap_path() { [[ $1 == /* && ${#1} -le 4096 && $1 != *[[:cntrl:]]* && ! $1 =~ $RE_DOTDOT ]]; }
+
+mounted() {
+  [[ -z $REQUIRED_MOUNT ]] && return 0
+  command -v mountpoint >/dev/null && mountpoint -q "$REQUIRED_MOUNT"
+}
+
+# ---- alerts (ntfy-style: POST the text, title in a header) ---------------------
+notify_url() {
+  local u=$NOTIFY_URL
+  if [[ -z $u && -f $NOTIFY_FILE ]]; then u=$(jq -r '.url // ""' "$NOTIFY_FILE" 2>/dev/null || true); fi
+  if [[ -n $u && ! $u =~ $RE_URL ]]; then u=""; fi
+  printf '%s' "$u"
+}
+
+send_alert() {   # send_alert TITLE MESSAGE [PRIORITY] → curl's status
+  local url
+  url=$(notify_url)
+  [[ -n $url ]] || return 2
+  command -v curl >/dev/null || return 3
+  curl -fsS -m 15 --proto '=https' -H "Title: $1" -H "Priority: ${3:-default}" -H "Tags: floppy_disk" \
+    --data-binary "$2" "$url" >/dev/null 2>&1
+}
+
+alert() {   # best effort: never fails the caller
+  local rc=0
+  send_alert "$@" || rc=$?
+  if ((rc == 1 || rc > 3)); then log "Could not send the alert (curl exit $rc)"; fi
+  return 0
+}
 
 # capture CMD...  → sets OUT (stdout) and ERRTXT (stderr), returns the command's status
 OUT="" ERRTXT=""
@@ -176,7 +222,9 @@ history_json() {
 
 append_history() {
   jq -c '{id, startedAt, finishedAt, status, message, dryRun, trigger: (.trigger // "manual"),
-          sources: [.steps[] | select(.kind == "backup") | .id],
+          kind: (.kind // "backup"),
+          sources: (if (.kind // "backup") == "restore" then (.restore.tags // [])
+                    else [.steps[] | select(.kind == "backup") | .id] end),
           dataAdded: ([.steps[] | (.result.dataAdded? // 0)] | add // 0)}' \
     "$STATE_FILE" >>"$HISTORY_FILE" 2>/dev/null || return 0
   tail -n "$HISTORY_MAX" "$HISTORY_FILE" >"$HISTORY_FILE.tmp" && mv -f "$HISTORY_FILE.tmp" "$HISTORY_FILE"
@@ -373,12 +421,32 @@ cmd_start() {
 }
 
 # start_job RAW_JOB_FILE TRIGGER(manual|scheduled) — validate, write state, launch the unit.
-start_job() {
-  local raw=$1 trigger=$2 job run_id
+# begin_job — take the start lock and make sure nothing else is running.
+begin_job() {
   exec 8>"$STATE_DIR/.start.lock"
   flock -n 8 || fail "another start request is in progress"
-  if job_running; then fail "a backup is already running"; fi
+  if job_running; then fail "a backup or restore is already running"; fi
   if cli_lock_busy; then fail "another backup (pi-backup CLI?) is holding $LOCK_FILE"; fi
+}
+
+# launch_job — job.json and state.json are written; start the transient unit.
+launch_job() {
+  rm -f "$PROGRESS_FILE"
+  if [[ -f $LOG_FILE ]]; then mv -f "$LOG_FILE" "$LOG_FILE.1"; fi
+  : >"$LOG_FILE"
+  systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+  if ! capture systemd-run --unit="$UNIT" --collect --quiet --description="Pi backup job" \
+      -p TimeoutStopSec=90 -p Nice=10 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=7 \
+      "$SELF" _run "$JOB_FILE"; then
+    state_update '.status="failed" | .message=$m | .finishedAt=$now | .steps |= map(.status="skipped")' --arg m "Could not launch job: $ERRTXT" || true
+    append_history
+    fail "could not launch job: $ERRTXT"
+  fi
+}
+
+start_job() {
+  local raw=$1 trigger=$2 job run_id
+  begin_job
 
   job=$(validate_job "$raw") || exit 1
   rm -f "$raw"
@@ -390,7 +458,7 @@ start_job() {
     def step(id; name; kind): {id:id, name:name, kind:kind, status:"pending", message:"",
                                startedAt:null, finishedAt:null, result:null};
     . as $j |
-    {id:$id, status:"running", message:"Starting…", startedAt:$now, updatedAt:$now, finishedAt:null,
+    {id:$id, kind:"backup", status:"running", message:"Starting…", startedAt:$now, updatedAt:$now, finishedAt:null,
      trigger:$trigger,
      dryRun:$j.options.dryRun, options:$j.options, destination:$j.destination, currentStep:null,
      steps: ([$j.sources[] | step(.id; .name; "backup")]
@@ -401,18 +469,7 @@ start_job() {
                 then [step("check"; "Verify repository (5% of data)"; "check")] else [] end))}' \
     "$JOB_FILE" >"$STATE_FILE.tmp"
   mv -f "$STATE_FILE.tmp" "$STATE_FILE"
-  rm -f "$PROGRESS_FILE"
-  if [[ -f $LOG_FILE ]]; then mv -f "$LOG_FILE" "$LOG_FILE.1"; fi
-  : >"$LOG_FILE"
-
-  systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
-  if ! capture systemd-run --unit="$UNIT" --collect --quiet --description="Pi backup job" \
-      -p TimeoutStopSec=90 -p Nice=10 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=7 \
-      "$SELF" _run "$JOB_FILE"; then
-    state_update '.status="failed" | .message=$m | .finishedAt=$now | .steps |= map(.status="skipped")' --arg m "Could not launch job: $ERRTXT" || true
-    append_history
-    fail "could not launch job: $ERRTXT"
-  fi
+  launch_job
   jq -cn --arg id "$run_id" '{ok:true, runId:$id}'
 }
 
@@ -443,15 +500,20 @@ cmd_status() {
     [[ -n $progress ]] || progress=null
   fi
   hist=$(history_json 2>/dev/null || echo '[]')
+  local is_mounted=false alerts=false
+  if mounted; then is_mounted=true; fi
+  if [[ -n $(notify_url) ]]; then alerts=true; fi
   jq -cn --arg unit "$us" --argjson running "$running" --argjson stale "$stale" \
     --argjson state "$state" --argjson progress "$progress" --argjson history "$hist" \
-    '{ok:true, running:$running, unit:$unit, stale:$stale, state:$state, progress:$progress, history:$history}'
+    --argjson mounted "$is_mounted" --arg mount "$REQUIRED_MOUNT" --argjson alerts "$alerts" \
+    '{ok:true, running:$running, unit:$unit, stale:$stale, state:$state, progress:$progress, history:$history,
+      health:{mounted:$mounted, requiredMount:$mount, alerts:$alerts}}'
 }
 
 cmd_cancel() {
-  job_running || fail "no backup is running"
+  job_running || fail "nothing is running"
   capture systemctl stop --no-block "$UNIT" || fail "could not stop job: $ERRTXT"
-  jq -cn '{ok:true, message:"Stopping the backup job…"}'
+  jq -cn '{ok:true, message:"Stopping…"}'
 }
 
 cmd_log() {
@@ -621,8 +683,181 @@ cmd_scheduled() {
   else
     sched_record '.lastAttempt = $now | .lastError = ($o.error? // "could not start")' \
       --argjson o "$(jq -c . <<<"$out" 2>/dev/null || echo '{}')" || true
+    alert "PiKeep: scheduled backup did not start on $(uname -n)" \
+      "$(jq -r '.error? // "unknown error"' <<<"$out" 2>/dev/null || echo "unknown error")" high
   fi
   printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+# parse_snapshot_args → REMOTE, RPATH, REPO, SNAP_ID, SNAP_DIR, SNAP_TAG
+parse_snapshot_args() {
+  local -a repo=()
+  SNAP_ID="" SNAP_DIR="" SNAP_TAG=""
+  while (($# > 0)); do
+    (($# >= 2)) || fail "missing value for $1"
+    case $1 in
+      --id)  SNAP_ID=$2 ;;
+      --dir) SNAP_DIR=$2 ;;
+      --tag) SNAP_TAG=$2 ;;
+      --remote|--path) repo+=("$1" "$2") ;;
+      *) fail "unknown argument" ;;
+    esac
+    shift 2
+  done
+  parse_repo_args "${repo[@]}"
+}
+
+snapshot_json() {   # snapshot_json ID → the snapshot object, or fail
+  local snap
+  capture restic -r "$REPO" --no-lock snapshots --json "$1" || fail "could not read the snapshot: $ERRTXT"
+  snap=$(jq -c '.[0] // empty' <<<"$OUT" 2>/dev/null || true)
+  [[ -n $snap ]] || fail "snapshot $1 not found"
+  printf '%s\n' "$snap"
+}
+
+# snapshot-ls --remote R --path P --id ID [--dir PATH]
+# Without --dir: the paths the snapshot was made of. With it: that folder's children.
+cmd_snapshot_ls() {
+  local snap
+  local -a targets
+  parse_snapshot_args "$@"
+  [[ $SNAP_ID =~ $RE_SNAP ]] || fail "invalid snapshot id"
+  if [[ -n $SNAP_DIR ]]; then valid_snap_path "$SNAP_DIR" || fail "invalid path"; fi
+  snap=$(snapshot_json "$SNAP_ID") || exit 1
+  if [[ -z $SNAP_DIR ]]; then mapfile -t targets < <(jq -r '.paths[]' <<<"$snap"); else targets=("$SNAP_DIR"); fi
+  capture restic -r "$REPO" --no-lock ls --json "$SNAP_ID" "${targets[@]}" || fail "could not list the snapshot: $ERRTXT"
+  jq -cs --arg dir "$SNAP_DIR" --argjson snap "$snap" '
+    [.[] | select(type == "object" and .path? != null and .type? != null)] as $nodes
+    | (if $dir == "" then
+         [$snap.paths[] as $p
+          | (($nodes | map(select(.path == $p)) | .[0])
+             // {path: $p, name: ($p | split("/") | last),
+                 type: (if ($p | test("\\.sql$")) then "file" else "dir" end)})]
+       else
+         [$nodes[] | select(.path != $dir and (.path | startswith($dir + "/"))
+                            and ((.path | ltrimstr($dir + "/")) | contains("/") | not))]
+       end)
+    | map({name, path, type, size: (.size // null), mtime: (.mtime // null)})
+    | sort_by([(.type != "dir"), (.name | ascii_downcase)])
+    | {ok: true, dir: (if $dir == "" then null else $dir end), truncated: (length > 5000), entries: .[0:5000],
+       snapshot: {id: $snap.id, short: ($snap.short_id // $snap.id[0:8]), time: $snap.time,
+                  tags: ($snap.tags // []), paths: $snap.paths, hostname: $snap.hostname}}' <<<"$OUT"
+}
+
+# restore — JSON on stdin:
+#   {"destination":{"remote","path"}, "snapshot":"<id>", "paths":["/..."], "target":"separate|original"}
+# "separate" writes into a new folder under RESTORE_DIR; "original" writes the
+# files back where they came from (only paths inside ALLOWED_ROOTS).
+cmd_restore() {
+  local raw target snap short tdir run_id p job
+  local -a paths=() check=()
+  raw=$(read_job_stdin) || exit 1
+  if ! jq -e 'type == "object" and (.destination | type == "object") and (.snapshot | type == "string")
+              and ((.paths // []) | type == "array" and length <= 50 and all(.[]; type == "string"))
+              and (.target | type == "string")
+              and ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)' "$raw" >/dev/null 2>&1; then
+    rm -f "$raw"
+    fail "restore request has the wrong structure"
+  fi
+  parse_repo_args --remote "$(jq -r '.destination.remote // ""' "$raw")" --path "$(jq -r '.destination.path // ""' "$raw")"
+  SNAP_ID=$(jq -r '.snapshot' "$raw")
+  target=$(jq -r '.target' "$raw")
+  mapfile -t paths < <(jq -r '(.paths // [])[]' "$raw")
+  rm -f "$raw"
+  [[ $SNAP_ID =~ $RE_SNAP ]] || fail "invalid snapshot id"
+  in_list "$target" separate original || fail "target must be 'separate' or 'original'"
+  for p in "${paths[@]}"; do valid_snap_path "$p" || fail "invalid path: $p"; done
+  mounted || fail "$REQUIRED_MOUNT is not mounted — connect and mount the backup disk first"
+
+  begin_job
+  snap=$(snapshot_json "$SNAP_ID") || exit 1
+  short=$(jq -r '.short_id // .id[0:8]' <<<"$snap")
+  if [[ $target == original ]]; then
+    # Never write outside the folders this Pi is configured to back up.
+    mapfile -t check < <(jq -r '.paths[]' <<<"$snap")
+    for p in "${check[@]}" "${paths[@]}"; do
+      resolve_allowed "$p" >/dev/null || fail "refusing to restore $p in place: it is outside the allowed folders"
+    done
+    tdir=/
+  else
+    tdir="$RESTORE_DIR/$(date +%Y%m%d-%H%M%S)-$short"
+    resolve_allowed "$tdir" >/dev/null || fail "RESTORE_DIR ($RESTORE_DIR) must be inside the allowed folders"
+  fi
+
+  job=$(jq -cn --arg remote "$REMOTE" --arg path "$RPATH" --argjson snap "$snap" --arg target "$target" \
+    --arg tdir "$tdir" --argjson paths "$(json_array "${paths[@]}")" '
+    {kind: "restore", destination: {remote: $remote, path: $path},
+     snapshot: {id: $snap.id, short: ($snap.short_id // $snap.id[0:8]), time: $snap.time,
+                tags: ($snap.tags // []), paths: $snap.paths},
+     paths: $paths, target: $target, targetDir: $tdir}')
+  printf '%s\n' "$job" >"$JOB_FILE.tmp"
+  mv -f "$JOB_FILE.tmp" "$JOB_FILE"
+
+  run_id=$(date +%Y%m%d-%H%M%S)
+  jq -n --arg id "$run_id" --arg now "$(now)" --argjson j "$job" '
+    {id: $id, kind: "restore", status: "running", message: "Starting…", startedAt: $now, updatedAt: $now,
+     finishedAt: null, trigger: "manual", dryRun: false, destination: $j.destination, currentStep: null,
+     restore: {snapshot: $j.snapshot.short, snapshotTime: $j.snapshot.time, tags: $j.snapshot.tags,
+               target: $j.target, targetDir: $j.targetDir, paths: $j.paths},
+     steps: [{id: "restore", kind: "restore", status: "pending", message: "", startedAt: null,
+              finishedAt: null, result: null,
+              name: ("Restore " + (if ($j.snapshot.tags | length) > 0 then ($j.snapshot.tags | join(", ")) + " " else "" end)
+                     + "from " + ($j.snapshot.time[0:16] | sub("T"; " ")))}]}' >"$STATE_FILE.tmp"
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+  launch_job
+  jq -cn --arg id "$run_id" --arg dir "$tdir" '{ok: true, runId: $id, targetDir: $dir}'
+}
+
+# accept-shrink --remote R --path P --tag ID — the user confirmed that a source
+# really is smaller now: stop comparing it against its older, larger snapshots.
+cmd_accept_shrink() {
+  local ids
+  parse_snapshot_args "$@"
+  [[ $SNAP_TAG =~ $RE_ID ]] || fail "invalid source id"
+  capture restic -r "$REPO" --no-lock snapshots --json --tag "$SNAP_TAG" || fail "could not list snapshots: $ERRTXT"
+  ids=$(jq -c '[.[].id]' <<<"$OUT")
+  local cur='{}'
+  if [[ -f $ACCEPT_FILE ]]; then cur=$(jq -c . "$ACCEPT_FILE" 2>/dev/null || echo '{}'); fi
+  jq -c --arg id "$SNAP_TAG" --argjson ids "$ids" '.[$id] = ((.[$id] // []) + $ids | unique)' <<<"$cur" >"$ACCEPT_FILE.tmp"
+  mv -f "$ACCEPT_FILE.tmp" "$ACCEPT_FILE"
+  jq -cn --arg id "$SNAP_TAG" --argjson n "$(jq length <<<"$ids")" '{ok: true, source: $id, accepted: $n}'
+}
+
+# notify-set — JSON on stdin {"url": "https://ntfy.sh/<topic>" | ""}
+cmd_notify_set() {
+  local raw url
+  raw=$(read_job_stdin) || exit 1
+  if ! jq -e 'type == "object" and ((.url // "") | type == "string")' "$raw" >/dev/null 2>&1; then
+    rm -f "$raw"
+    fail "expected {\"url\": \"https://...\"}"
+  fi
+  url=$(jq -r '.url // ""' "$raw")
+  rm -f "$raw"
+  if [[ -n $url && ! $url =~ $RE_URL ]]; then fail "alert URL must look like https://ntfy.sh/your-topic"; fi
+  jq -cn --arg url "$url" '{url: $url}' >"$NOTIFY_FILE.tmp"
+  mv -f "$NOTIFY_FILE.tmp" "$NOTIFY_FILE"
+  jq -cn --argjson on "$([[ -n $url ]] && echo true || echo false)" '{ok: true, alerts: $on}'
+}
+
+cmd_notify_get() {
+  local url
+  url=$(notify_url)
+  jq -cn --arg url "$url" --argjson fromConf "$([[ -n $NOTIFY_URL ]] && echo true || echo false)" \
+    '{ok: true, url: $url, fromConfig: $fromConf}'
+}
+
+cmd_notify_test() {
+  local rc=0
+  send_alert "PiKeep test from $(uname -n)" "Alerts work. You will get one when a backup fails or needs attention." default || rc=$?
+  case $rc in
+    0) jq -cn '{ok: true}' ;;
+    2) fail "no alert URL is set" ;;
+    3) fail "curl is not installed on the Pi" ;;
+    *) fail "sending the test alert failed (curl exit $rc)" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -632,6 +867,7 @@ CANCELLED=0
 FATAL_MSG=""
 NC_MAINT_APP=""
 SUMMARY=""
+ALERTS=()
 ERRCOUNT=0
 LAST_FATAL=""
 
@@ -651,8 +887,8 @@ write_progress() {   # write_progress INDEX NAME [STATUS_JSON]
   jq -c --argjson i "$1" --arg name "$2" --arg now "$(now)" --argjson indet "$([[ -z ${3:-} ]] && echo true || echo false)" '
     {step:$i, stepName:$name, indeterminate:$indet,
      percent:(if $indet then null else ((.percent_done // 0) * 100) end),
-     bytesDone:(.bytes_done // 0), totalBytes:(.total_bytes // 0),
-     filesDone:(.files_done // 0), totalFiles:(.total_files // 0),
+     bytesDone:(.bytes_done // .bytes_restored // 0), totalBytes:(.total_bytes // 0),
+     filesDone:(.files_done // .files_restored // 0), totalFiles:(.total_files // 0),
      elapsed:(.seconds_elapsed // 0), eta:(.seconds_remaining // null),
      currentFile:((.current_files // [])[0] // null), errorCount:(.error_count // 0),
      updatedAt:$now}' <<<"$json" >"$PROGRESS_FILE.tmp" 2>/dev/null \
@@ -729,7 +965,39 @@ dump_mariadb() {   # dump_mariadb CONTAINER OUTFILE
   finish_dump "$2"
 }
 
-run_source() {   # run_source INDEX  → 0 if a snapshot was written (done/warning)
+# shrink_check ID SUMMARY_JSON — 1 if this snapshot holds far less than the largest
+# earlier snapshot of the same source (SHRINK_MSG explains), else 0. Snapshots the
+# user accepted a shrink for (accept-shrink) are not compared against.
+SHRINK_MSG=""
+shrink_check() {
+  local id=$1 summary=$2 ignored ref
+  SHRINK_MSG=""
+  ((SHRINK_GUARD_PERCENT > 0)) || return 0
+  ignored=$(jq -c --arg id "$id" '.[$id] // []' "$ACCEPT_FILE" 2>/dev/null || echo '[]')
+  [[ -n $ignored ]] || ignored='[]'
+  if ! capture restic --no-lock snapshots --json --tag "$id"; then
+    log "Shrink check skipped: could not list snapshots ($ERRTXT)"
+    return 0
+  fi
+  ref=$(jq -c --argjson ignored "$ignored" --arg cur "$(jq -r '.snapshot_id // ""' <<<"$summary")" '
+    [.[] | select(.id != $cur and .summary != null and (([.id] | inside($ignored)) | not))
+         | .summary | {files: (.total_files_processed // 0), bytes: (.total_bytes_processed // 0)}]
+    | if length == 0 then null else {files: (map(.files) | max), bytes: (map(.bytes) | max)} end' <<<"$OUT" 2>/dev/null || echo null)
+  [[ -n $ref && $ref != null ]] || return 0
+  if jq -e --argjson ref "$ref" --argjson pct "$SHRINK_GUARD_PERCENT" '
+      ((.total_files_processed // 0) * 100 < $ref.files * $pct)
+      or ((.total_bytes_processed // 0) * 100 < $ref.bytes * $pct)' <<<"$summary" >/dev/null; then
+    SHRINK_MSG=$(jq -r --argjson ref "$ref" '
+      def h: if . >= 1073741824 then "\(. / 1073741824 * 10 | floor / 10) GB"
+             elif . >= 1048576 then "\(. / 1048576 * 10 | floor / 10) MB"
+             else "\(. / 1024 | floor) KB" end;
+      "\(.total_files_processed // 0) files (\((.total_bytes_processed // 0) | h)), down from \($ref.files) files (\($ref.bytes | h))"' <<<"$summary")
+    return 1
+  fi
+  return 0
+}
+
+run_source() {   # run_source INDEX  → 0 only if the snapshot is complete and may trigger clean-up
   local i=$1 id name ht hc ha dump="" p rc msg
   local -a paths excl args
   id=$(jopt ".sources[$i].id")
@@ -801,10 +1069,20 @@ run_source() {   # run_source INDEX  → 0 if a snapshot was written (done/warni
   fi
   case $rc in
     0)
+      if [[ $DRY != true && -n $SUMMARY ]] && ! shrink_check "$id" "$SUMMARY"; then
+        log "SHRINK GUARD: $name has $SHRINK_MSG — older backups are kept"
+        state_update '.steps[$i].result.shrink = true' --argjson i "$i" || true
+        ALERTS+=("$name shrank: $SHRINK_MSG. Older backups were kept.")
+        step_set "$i" warning "Much less data than before: $SHRINK_MSG. Older backups kept — accept it in the app if this was intended."
+        return 1
+      fi
       msg=$([[ $DRY == true ]] && echo "Dry run complete" || echo "Snapshot saved")
       step_set "$i" "done" "$msg"; return 0 ;;
     3)
-      step_set "$i" warning "Snapshot saved, but $ERRCOUNT file(s) could not be read (see log)"; return 0 ;;
+      # Some files could not be read (a failing disk looks exactly like this), so
+      # this snapshot must not be the reason older, complete ones get deleted.
+      step_set "$i" warning "Snapshot saved, but $ERRCOUNT file(s) could not be read — older backups kept (see log)"
+      return 1 ;;
     *)
       step_set "$i" failed "restic failed (exit $rc)${LAST_FATAL:+: $LAST_FATAL}"; return 1 ;;
   esac
@@ -815,7 +1093,7 @@ run_preflight() {
   for c in restic rclone jq; do
     command -v "$c" >/dev/null || { FATAL_MSG="'$c' is not installed"; return 1; }
   done
-  if jq -e '[.sources[].hook.type] | any(. != "none")' "$JOB_FILE" >/dev/null; then
+  if jq -e '[(.sources // [])[].hook.type] | any(. != "none")' "$JOB_FILE" >/dev/null 2>&1; then
     command -v docker >/dev/null || { FATAL_MSG="'docker' is not installed"; return 1; }
   fi
   if [[ -n $REQUIRED_MOUNT ]] && ! mountpoint -q "$REQUIRED_MOUNT"; then
@@ -846,6 +1124,7 @@ run_finish() {
                   elif $rc != 0 then "The job exited unexpectedly (exit \($rc))"
                   elif .status == "failed" then "Some steps failed — see the log"
                   elif .status == "warning" then "Completed with warnings"
+                  elif (.kind // "backup") == "restore" then "Restore completed"
                   elif .dryRun then "Dry run completed"
                   else "Backup completed" end)
     | .finishedAt = $now | .currentStep = null' \
@@ -853,7 +1132,54 @@ run_finish() {
     --arg fatal "$FATAL_MSG" --argjson rc "$rc" || true
   append_history || true
   rm -f "$PROGRESS_FILE"
+  local final kind what msg
+  final=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo failed)
+  kind=$(jq -r '.kind // "backup"' "$STATE_FILE" 2>/dev/null || echo backup)
   log "Finished: $(jq -r '.status + " — " + .message' "$STATE_FILE" 2>/dev/null || echo "rc=$rc")"
+  if [[ $final == failed || $final == warning ]]; then
+    what=$([[ $kind == restore ]] && echo Restore || echo Backup)
+    msg=$(jq -r '.message + "\n" + ([.steps[] | select(.status == "failed" or .status == "warning")
+                  | "• \(.name): \(.message)"] | join("\n"))' "$STATE_FILE" 2>/dev/null || echo "$final")
+    alert "PiKeep: $what $([[ $final == failed ]] && echo failed || echo "needs attention") on $(uname -n)" "$msg" \
+      "$([[ $final == failed ]] && echo high || echo default)"
+  fi
+}
+
+# run_restore — the restore job (job.json kind "restore"), inside the unit.
+run_restore() {
+  local id target tdir rc p
+  local -a paths args
+  id=$(jopt '.snapshot.id')
+  target=$(jopt '.target')
+  tdir=$(jopt '.targetDir')
+  mapfile -t paths < <(jopt '.paths[]')
+
+  log "Restore of snapshot $id from $RESTIC_REPOSITORY to $tdir (${#paths[@]} selected path(s); target: $target)"
+  state_update '.message="Checking repository…"' || true
+  run_preflight || exit 1
+  if ! capture restic cat config; then
+    FATAL_MSG="Cannot open the repository $RESTIC_REPOSITORY: $ERRTXT"
+    exit 1
+  fi
+  state_update '.message="Running"' || true
+  step_set 0 running "Downloading from OneDrive"
+  write_progress 0 "Restore"
+  if [[ $target == separate ]]; then mkdir -p "$tdir"; fi
+
+  args=(restore "$id" --target "$tdir" --json)
+  for p in "${paths[@]}"; do args+=(--include "$p"); done
+  rc=0
+  run_restic_json 0 "Restore" "${args[@]}" || rc=$?
+  if [[ -n $SUMMARY ]]; then
+    step_result 0 "$(jq -c --arg t "$tdir" '{filesRestored:(.files_restored // .total_files // 0),
+        bytesRestored:(.bytes_restored // .total_bytes // 0), totalFiles:(.total_files // null),
+        duration:(.seconds_elapsed // null), targetDir:$t}' <<<"$SUMMARY" 2>/dev/null || echo null)"
+  fi
+  if ((rc == 0)); then
+    step_set 0 "done" "$([[ $target == separate ]] && echo "Restored into $tdir" || echo "Restored to the original location")"
+  else
+    step_set 0 failed "restic restore failed (exit $rc)${LAST_FATAL:+: $LAST_FATAL} — see the log"
+  fi
 }
 
 cmd_run() {
@@ -878,6 +1204,10 @@ cmd_run() {
   n=$(jopt '.sources | length')
   RESTIC_REPOSITORY="rclone:$(jopt '.destination.remote'):$(jopt '.destination.path')"
   export RESTIC_REPOSITORY
+  if [[ $(jopt '.kind // "backup"') == restore ]]; then
+    run_restore
+    exit 0
+  fi
 
   log "Backup started (repository $RESTIC_REPOSITORY, dry run: $DRY, cleanup: $cleanup keep $keep, check: $check)"
   state_update '.message="Checking repository…"' || true
@@ -896,7 +1226,7 @@ cmd_run() {
   idx=$n
   if [[ $cleanup == true ]]; then
     if ((${#ok_tags[@]} == 0)); then
-      step_set "$idx" skipped "No successful backups — nothing cleaned up"
+      step_set "$idx" skipped "No complete backups in this run — nothing cleaned up"
     else
       step_set "$idx" running "Removing backups older than the last $keep"
       write_progress "$idx" "Clean up"
@@ -928,8 +1258,8 @@ cmd_run() {
 }
 
 usage() {
-  sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//' >&2
-  fail "usage: pi-backup-agent <info|remotes|browse|init|validate|start|status|cancel|log|snapshots|schedule|schedule-set>"
+  sed -n '3,24p' "$SELF" | sed 's/^# \{0,1\}//' >&2
+  fail "usage: pi-backup-agent <info|remotes|browse|init|validate|start|status|cancel|log|snapshots|schedule|schedule-set|snapshot-ls|restore|accept-shrink|notify|notify-set|notify-test>"
 }
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1285,12 @@ main() {
     schedule)  cmd_schedule ;;
     schedule-set) cmd_schedule_set ;;
     _scheduled) cmd_scheduled ;;
+    snapshot-ls)   cmd_snapshot_ls "$@" ;;
+    restore)       cmd_restore ;;
+    accept-shrink) cmd_accept_shrink "$@" ;;
+    notify)        cmd_notify_get ;;
+    notify-set)    cmd_notify_set ;;
+    notify-test)   cmd_notify_test ;;
     *)         usage ;;
   esac
 }

@@ -144,6 +144,7 @@ Future<AppState> _demoState({required bool running}) async {
             'errorCount': 0,
           },
           'history': history,
+          'health': {'mounted': true, 'requiredMount': '/mnt/ssd', 'alerts': true},
         }
       : {
           'running': false,
@@ -170,6 +171,7 @@ Future<AppState> _demoState({required bool running}) async {
             ],
           },
           'history': history,
+          'health': {'mounted': true, 'requiredMount': '/mnt/ssd', 'alerts': true},
         };
   return state;
 }

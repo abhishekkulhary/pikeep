@@ -248,4 +248,41 @@ class AgentClient {
 
   Future<Map<String, dynamic>> setSchedule(Map<String, dynamic> body) =>
       _json(['schedule-set'], stdin: jsonEncode(body));
+
+  // ---- restore ----------------------------------------------------------------
+
+  /// Without [dir]: the paths the snapshot was made of. With it: that folder's children.
+  Future<Map<String, dynamic>> snapshotLs(Destination d, String id, {String? dir}) => _json(
+        ['snapshot-ls', '--remote', d.remote, '--path', d.path, '--id', id, if (dir != null) ...['--dir', dir]],
+        timeout: const Duration(minutes: 3),
+      );
+
+  /// Starts a restore job on the Pi; returns where the files will be written.
+  Future<String> restore(Destination d, String snapshotId,
+      {required List<String> paths, required bool inPlace}) async {
+    final m = await _json(['restore'],
+        stdin: jsonEncode({
+          'destination': d.toJson(),
+          'snapshot': snapshotId,
+          'paths': paths,
+          'target': inPlace ? 'original' : 'separate',
+        }),
+        timeout: const Duration(minutes: 2));
+    return m['targetDir'] as String;
+  }
+
+  Future<void> acceptShrink(Destination d, String sourceId) => _json(
+      ['accept-shrink', '--remote', d.remote, '--path', d.path, '--tag', sourceId],
+      timeout: const Duration(minutes: 2));
+
+  // ---- alerts -------------------------------------------------------------------
+
+  Future<({String url, bool fromConfig})> notifyGet() async {
+    final m = await _json(['notify']);
+    return (url: (m['url'] as String?) ?? '', fromConfig: m['fromConfig'] == true);
+  }
+
+  Future<void> notifySet(String url) => _json(['notify-set'], stdin: jsonEncode({'url': url}));
+
+  Future<void> notifyTest() => _json(['notify-test'], timeout: const Duration(seconds: 40));
 }

@@ -5,6 +5,7 @@ import '../format.dart';
 import '../models.dart';
 import '../widgets.dart';
 import 'log_screen.dart';
+import 'restore_guide_screen.dart';
 import 'schedule_screen.dart';
 
 class HomeScreen extends StatelessWidget {
@@ -33,6 +34,7 @@ class HomeScreen extends StatelessWidget {
           final job = state.jobState;
           return PageBody(onRefresh: state.refresh, children: [
             _ConnectionCard(state: state, openSettings: openSettings),
+            if (state.connState == ConnState.connected) ..._healthNotices(context),
             if (state.statusError != null && state.connState == ConnState.connected)
               Notice(state.statusError!),
             if (state.running)
@@ -40,7 +42,8 @@ class HomeScreen extends StatelessWidget {
             else if (state.connState == ConnState.connected)
               _StartCard(state: state, openSettings: openSettings),
             if (state.connState == ConnState.connected) _ScheduleCard(state: state),
-            if (job != null && !state.running) _LastRunCard(job: job, stale: state.status?['stale'] == true),
+            if (job != null && !state.running)
+              _LastRunCard(job: job, stale: state.status?['stale'] == true, state: state),
             if (state.history.isNotEmpty) _HistoryCard(history: state.history),
           ]);
         },
@@ -50,6 +53,45 @@ class HomeScreen extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+
+extension on HomeScreen {
+  /// What needs attention: the disk is gone, backups stopped, or nobody would hear about it.
+  List<Widget> _healthNotices(BuildContext context) {
+    final out = <Widget>[];
+    final mount = (state.health['requiredMount'] as String?) ?? (state.info?['requiredMount'] as String?) ?? '/mnt/ssd';
+    if (!state.diskMounted) {
+      out.add(Notice(
+        'The backup disk ($mount) is not mounted. Backups are refusing to run — nothing on OneDrive is '
+        'deleted. If the SSD died, replace it and restore from Snapshots.',
+        action: TextButton(
+          onPressed: () => Navigator.push(
+              context, MaterialPageRoute(builder: (_) => const RestoreGuideScreen())),
+          child: const Text('What now'),
+        ),
+      ));
+    }
+    if (!state.running && state.backupOverdue) {
+      final last = state.lastGoodBackup;
+      out.add(Notice(
+        last == null
+            ? 'No backup has completed yet.'
+            : 'The last completed backup was ${fmtAgo(last.toUtc().toIso8601String())} — '
+                'longer than expected. Check the last run below.',
+        kind: NoticeKind.warning,
+      ));
+    }
+    if (state.scheduleActive && !state.alertsOn && state.status != null) {
+      out.add(Notice(
+        'Automatic backups are on, but alerts are off — a failure would go unnoticed until you open the app.',
+        kind: NoticeKind.info,
+        action: TextButton(onPressed: openSettings, child: const Text('Set up')),
+      ));
+    }
+    return out;
+  }
+}
 
 class _ConnectionCard extends StatelessWidget {
   const _ConnectionCard({required this.state, required this.openSettings});
@@ -239,12 +281,16 @@ class _ProgressCard extends StatelessWidget {
   const _ProgressCard({required this.state});
   final AppState state;
 
+  bool get _restore => state.jobKind == 'restore';
+
   Future<void> _cancel(BuildContext context) async {
     final ok = await confirm(context,
-        title: 'Cancel the backup?',
-        content: const Text('The running step is stopped. Snapshots that already finished are kept, '
-            'and Nextcloud maintenance mode is switched off.'),
-        ok: 'Cancel backup',
+        title: _restore ? 'Cancel the restore?' : 'Cancel the backup?',
+        content: Text(_restore
+            ? 'The restore stops where it is. Files restored so far stay where they were written.'
+            : 'The running step is stopped. Snapshots that already finished are kept, '
+                'and Nextcloud maintenance mode is switched off.'),
+        ok: _restore ? 'Cancel restore' : 'Cancel backup',
         destructive: true);
     if (!ok || !context.mounted) return;
     final err = await state.cancelBackup();
@@ -263,7 +309,11 @@ class _ProgressCard extends StatelessWidget {
     final text = Theme.of(context).textTheme;
 
     return SectionCard(
-      title: job['dryRun'] == true ? 'Dry run in progress' : 'Backup in progress',
+      title: _restore
+          ? 'Restore in progress'
+          : job['dryRun'] == true
+              ? 'Dry run in progress'
+              : 'Backup in progress',
       trailing: Text(fmtAgo(job['startedAt'] as String?), style: text.bodySmall),
       children: [
         Padding(
@@ -301,7 +351,7 @@ class _ProgressCard extends StatelessWidget {
           child: OutlinedButton.icon(
             onPressed: state.busy ? null : () => _cancel(context),
             icon: const Icon(Icons.stop),
-            label: const Text('Cancel backup'),
+            label: Text(_restore ? 'Cancel restore' : 'Cancel backup'),
             style: OutlinedButton.styleFrom(
               foregroundColor: Theme.of(context).colorScheme.error,
               minimumSize: const Size.fromHeight(44),
@@ -314,11 +364,32 @@ class _ProgressCard extends StatelessWidget {
 }
 
 class _StepList extends StatelessWidget {
-  const _StepList({required this.steps});
+  const _StepList({required this.steps, this.state});
   final List<Map<String, dynamic>> steps;
+
+  /// When given, steps flagged by the shrink guard offer "accept".
+  final AppState? state;
+
+  Future<void> _accept(BuildContext context, Map<String, dynamic> step) async {
+    final ok = await confirm(context,
+        title: 'Accept the smaller backup?',
+        content: Text('Only if ${step['name']} really holds less data now (you deleted things on purpose). '
+            'From the next backup on, it is compared with this new size, and old backups are cleaned '
+            'up again as usual.'),
+        ok: 'Accept');
+    if (!ok || !context.mounted) return;
+    final err = await state!.acceptShrink(step['id'] as String);
+    if (context.mounted) {
+      showSnack(context, err ?? 'Accepted — the next backup cleans up as usual', error: err != null);
+    }
+  }
 
   String? _resultLine(Map<String, dynamic>? r) {
     if (r == null) return null;
+    if (r.containsKey('filesRestored')) {
+      return '${r['filesRestored']} files · ${fmtBytes(r['bytesRestored'] as num?)}'
+          '${r['duration'] != null ? ' · ${fmtDuration(r['duration'] as num?)}' : ''}';
+    }
     final parts = <String>[
       '${fmtBytes(r['dataAdded'] as num?)} new data',
       '${r['filesNew']} new · ${r['filesChanged']} changed · ${r['filesUnmodified']} unchanged files',
@@ -340,6 +411,15 @@ class _StepList extends StatelessWidget {
           subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             if ((s['message'] as String? ?? '').isNotEmpty) Text(s['message'] as String),
             if (_resultLine(s['result'] as Map<String, dynamic>?) case final line?) Text(line, style: small),
+            if (state != null && (s['result'] as Map<String, dynamic>?)?['shrink'] == true)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => _accept(context, s),
+                  icon: const Icon(Icons.check, size: 18),
+                  label: const Text('This was intended — accept'),
+                ),
+              ),
           ]),
         ),
     ]);
@@ -349,16 +429,21 @@ class _StepList extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _LastRunCard extends StatelessWidget {
-  const _LastRunCard({required this.job, required this.stale});
+  const _LastRunCard({required this.job, required this.stale, required this.state});
   final Map<String, dynamic> job;
   final bool stale;
+  final AppState state;
 
   @override
   Widget build(BuildContext context) {
     final status = job['status'] as String?;
     final steps = ((job['steps'] as List?) ?? const []).cast<Map<String, dynamic>>();
     return SectionCard(
-      title: job['dryRun'] == true ? 'Last dry run' : 'Last run',
+      title: job['kind'] == 'restore'
+          ? 'Last restore'
+          : job['dryRun'] == true
+              ? 'Last dry run'
+              : 'Last run',
       trailing: Text(fmtTime(job['finishedAt'] as String? ?? job['startedAt'] as String?),
           style: Theme.of(context).textTheme.bodySmall),
       children: [
@@ -368,7 +453,24 @@ class _LastRunCard extends StatelessWidget {
           subtitle: stale ? const Text('Detected after the job died without reporting back.') : null,
         ),
         const Divider(height: 8),
-        _StepList(steps: steps),
+        _StepList(steps: steps, state: state),
+        if (job['kind'] == 'restore' && status == 'success')
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Notice(
+              (job['restore'] as Map<String, dynamic>?)?['target'] == 'original'
+                  ? 'Files are back in place. If this snapshot had a database dump, load it now, then start '
+                      'the app again.'
+                  : 'Files are in ${(job['restore'] as Map<String, dynamic>?)?['targetDir'] ?? 'the restore folder'} '
+                      'on the Pi. Copy back what you need.',
+              kind: NoticeKind.info,
+              action: TextButton(
+                onPressed: () => Navigator.push(
+                    context, MaterialPageRoute(builder: (_) => const RestoreGuideScreen())),
+                child: const Text('Guide'),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -387,7 +489,8 @@ class _HistoryCard extends StatelessWidget {
           leading: StatusIcon(h['status'] as String?),
           title: Text('${fmtTime(h['startedAt'] as String?)}'
               '${h['dryRun'] == true ? '  · dry run' : ''}'
-              '${h['trigger'] == 'scheduled' ? '  · scheduled' : ''}'),
+              '${h['trigger'] == 'scheduled' ? '  · scheduled' : ''}'
+              '${h['kind'] == 'restore' ? '  · restore' : ''}'),
           subtitle: Text([
             ((h['sources'] as List?) ?? const []).join(', '),
             if ((h['dataAdded'] as num? ?? 0) > 0) '+${fmtBytes(h['dataAdded'] as num?)}',

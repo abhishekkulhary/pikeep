@@ -22,10 +22,19 @@ Website and downloads: **https://abhishekkulhary.github.io/pikeep/**
 - **Automatic backups** — daily, every second day, weekly or monthly, run by a
   systemd timer on the Pi. Missed runs (Pi switched off) happen at next boot.
 - **Keep the last N** — old snapshots are pruned after each backup (2 per
-  source by default); only sources that succeeded in that run are touched.
+  source by default); only sources whose backup was complete are touched.
 - **Immich and Nextcloud built in** — PostgreSQL/MariaDB dumps before the
   upload, Nextcloud maintenance mode during it (always switched back off).
 - **Any folder** — add sources with a folder browser that shows the Pi's disk.
+- **Restore from the app** — browse any snapshot, restore selected files or
+  folders into a separate folder, or a whole snapshot back in place (for a
+  replaced disk). Runs on the Pi with live progress; a built-in guide covers
+  loading the database dumps.
+- **Safe clean-up** — a run with unreadable files, or a source that shrank below
+  half of its largest backup (`SHRINK_GUARD_PERCENT`), never triggers clean-up;
+  you confirm an intended shrink in the app.
+- **Alerts** — the Pi sends an ntfy push notification when a backup fails, needs
+  attention, or a scheduled run cannot start (e.g. the SSD is not mounted).
 - **Dry runs, verification and a snapshot list** per source.
 - **Careful by default** — SSH host keys are pinned on first use, secrets live
   in the platform keychain, no account, no telemetry.

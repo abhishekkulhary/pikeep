@@ -39,6 +39,7 @@ for c in restic rclone systemd-run systemctl flock mountpoint realpath find visu
 done
 ((${#missing[@]} == 0)) || die "missing commands: ${missing[*]} (install restic and rclone first)"
 command -v docker >/dev/null || warn "docker not found — database hooks (PostgreSQL, MariaDB, Nextcloud) will not work"
+command -v curl >/dev/null || warn "curl not found — failure alerts cannot be sent (sudo apt install curl)"
 
 say "Installing $AGENT_DST"
 # New inode + rename: a job that is running keeps reading the old file safely.

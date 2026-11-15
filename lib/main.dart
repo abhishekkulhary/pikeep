@@ -57,10 +57,20 @@ class _RootShellState extends State<RootShell> {
       },
       onPause: widget.state.pausePolling,
     );
+    widget.state.tabRequest.addListener(_onTabRequest);
+  }
+
+  void _onTabRequest() {
+    final t = widget.state.tabRequest.value;
+    if (t == null || !mounted) return;
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    _go(t);
+    widget.state.tabRequest.value = null;
   }
 
   @override
   void dispose() {
+    widget.state.tabRequest.removeListener(_onTabRequest);
     _lifecycle.dispose();
     super.dispose();
   }
